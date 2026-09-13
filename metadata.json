@@ -1,0 +1,6 @@
+{
+  "name": "X Campaign Planner & Scheduler",
+  "description": "An interactive planning, simulation, and analysis dashboard for the @r_comic_book monthly marketing campaign on X.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
