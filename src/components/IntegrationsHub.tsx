@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
-  Share2, Check, RefreshCw, Key, Link2, LogOut, Terminal, 
+  Share2, Check, RefreshCw, Key, Link2, LogOut, Terminal, ShieldCheck,
   Send, AlertCircle, Sparkles, Sliders, ChevronDown, CheckCircle2, XCircle
 } from 'lucide-react';
 import { CampaignData, Post, FloatPost, LedgerEntry } from '../types';
@@ -208,6 +208,14 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       localStorage.setItem('campaign_platform_connections', JSON.stringify(connections));
     }
   }, [connections]);
+
+  const [publishingMode, setPublishingMode] = useState<'zero_cost' | 'direct_api'>(() => {
+    return (localStorage.getItem('campaign_publishing_mode') as 'zero_cost' | 'direct_api') || 'zero_cost';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('campaign_publishing_mode', publishingMode);
+  }, [publishingMode]);
 
   const [activeConfigPlatform, setActiveConfigPlatform] = useState<string | null>(null);
   const [tempCredentials, setTempCredentials] = useState<Record<string, string>>({});
@@ -585,6 +593,10 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       `[${new Date().toLocaleTimeString()}] Initiating Quick-Link OAuth callback flow for ${platform.name}...`
     ]);
 
+    const defaultHandle = platformId === 'x' 
+      ? (campaignData?.meta?.account ? (campaignData.meta.account.startsWith('@') ? campaignData.meta.account : `@${campaignData.meta.account}`) : platform.placeholder)
+      : platform.placeholder;
+
     // Simulate connection popup
     const width = 600;
     const height = 650;
@@ -614,6 +626,11 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
                 </div>
               </div>
 
+              <div class="flex items-center gap-2 px-3 py-2 bg-neutral-100 rounded-lg border border-neutral-200">
+                <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                <span class="text-[10px] text-neutral-500">Authorized Workspace Session: <strong>ee.ee455@gmail.com</strong></span>
+              </div>
+
               <div class="bg-neutral-100 p-4 rounded-xl border border-neutral-200 text-xs space-y-2">
                 <p class="font-bold text-neutral-700">Applet Requests Permissions to:</p>
                 <ul class="list-disc pl-5 space-y-1 text-neutral-600">
@@ -628,7 +645,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
                 <input 
                   type="text" 
                   id="account-handle" 
-                  value="${platform.placeholder}" 
+                  value="${defaultHandle}" 
                   class="w-full p-2.5 bg-white border border-neutral-200 rounded-lg text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-neutral-950"
                   placeholder="Enter handle"
                 />
@@ -645,7 +662,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
               </button>
               <button 
                 onclick="
-                  const val = document.getElementById('account-handle').value || '${platform.placeholder}';
+                  const val = document.getElementById('account-handle').value || '${defaultHandle}';
                   window.opener.postMessage({ 
                     type: 'PLATFORM_AUTH_SUCCESS', 
                     platformId: '${platformId}', 
@@ -692,12 +709,14 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
       if (event.data?.type === 'PLATFORM_AUTH_SUCCESS') {
         const { platformId, handle } = event.data;
+        const cleanHandle = handle || PLATFORMS.find(p => p.id === platformId)?.placeholder || '@connected';
+        
         setConnections(prev => ({
           ...prev,
           [platformId]: {
             ...prev[platformId],
             connected: true,
-            handle: handle || PLATFORMS.find(p => p.id === platformId)?.placeholder || '@connected',
+            handle: cleanHandle,
             syncEnabled: true
           }
         }));
@@ -705,14 +724,49 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
         const pName = PLATFORMS.find(p => p.id === platformId)?.name;
         setConsoleLogs(prev => [
           ...prev,
-          `[${new Date().toLocaleTimeString()}] Successfully authorized and linked ${pName} account "${handle}"!`
+          `[${new Date().toLocaleTimeString()}] Successfully authorized and linked ${pName} account "${cleanHandle}"!`
         ]);
+
+        // Auto-integrate with the active campaign account!
+        if (platformId === 'x' && onUpdateCampaignData) {
+          const rawAccount = cleanHandle.startsWith('@') ? cleanHandle.substring(1) : cleanHandle;
+          onUpdateCampaignData({
+            ...campaignData,
+            meta: {
+              ...campaignData.meta,
+              account: rawAccount
+            }
+          });
+        }
       }
     };
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, []);
+  }, [campaignData, onUpdateCampaignData]);
+
+  // Synchronize campaignData.meta.account changes to the X connection handle
+  useEffect(() => {
+    if (campaignData?.meta?.account) {
+      const formattedHandle = campaignData.meta.account.startsWith('@') 
+        ? campaignData.meta.account 
+        : `@${campaignData.meta.account}`;
+        
+      setConnections(prev => {
+        const xConn = prev['x'];
+        if (xConn && xConn.handle !== formattedHandle) {
+          return {
+            ...prev,
+            'x': {
+              ...xConn,
+              handle: formattedHandle
+            }
+          };
+        }
+        return prev;
+      });
+    }
+  }, [campaignData?.meta?.account]);
 
   const handleDisconnect = (platformId: string) => {
     const pName = PLATFORMS.find(p => p.id === platformId)?.name;
@@ -844,6 +898,47 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     }
 
     setIsPublishing(true);
+
+    if (publishingMode === 'zero_cost') {
+      setConsoleLogs(prev => [
+        ...prev,
+        `[${new Date().toLocaleTimeString()}] 🚀 Initiating campaign synchronized posting (Zero-Cost Manual Mode)...`,
+        `[${new Date().toLocaleTimeString()}] Text Content length: ${customDraftText.length} characters.`
+      ]);
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      try {
+        await navigator.clipboard.writeText(customDraftText);
+        setShowCopySuccessToast(true);
+        setTimeout(() => setShowCopySuccessToast(false), 3000);
+      } catch (e) {
+        // ignore block
+      }
+
+      setHelperTargets(activeTargets);
+      setConsoleLogs(prev => [
+        ...prev,
+        `[${new Date().toLocaleTimeString()}] 🔔 Copied content text to Clipboard! Launch helper modal triggered for ${activeTargets.length} channel(s).`,
+        `[${new Date().toLocaleTimeString()}] 🏁 Zero-Cost manual publish setup complete. Paste content into launched composers.`
+      ]);
+
+      const newLog: PublishLog = {
+        id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+        timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+        postText: customDraftText,
+        postRef: `Week ${selectedWeek} Day ${selectedDay} (${selectedPostId ? `ID: ${selectedPostId}` : 'Manual Draft'})`,
+        platforms: activeTargets.map(t => PLATFORMS.find(p => p.id === t)?.name || t),
+        status: 'SUCCESS',
+        details: 'Draft prepared and clipboard copied for direct manual publish (Zero-Cost Mode).',
+        isReal: false
+      };
+
+      setAuditLogs(prev => [newLog, ...prev]);
+      setIsPublishing(false);
+      return;
+    }
+
     setConsoleLogs(prev => [
       ...prev,
       `[${new Date().toLocaleTimeString()}] 🚀 Initiating campaign synchronized posting...`,
@@ -1029,6 +1124,46 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             <span className="block font-black text-xl text-purple-700 font-mono mt-0.5">
               {connectionList.filter((c: ConnectionState) => c.connected && Object.keys(c.credentials || {}).length > 0).length} Channels
             </span>
+          </div>
+        </div>
+      </div>
+
+      {/* ZERO-COST PUBLISHING TOGGLE SWITCH */}
+      <div className="bg-gradient-to-r from-purple-50 to-neutral-50 border border-purple-200 rounded-xl p-5 shadow-sm space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-purple-700 bg-purple-100 border border-purple-200/50 px-2 py-0.5 rounded-full uppercase tracking-wider font-mono">
+              💎 FREE DIRECT DISPATCH (RECOMMENDED)
+            </span>
+            <h3 className="text-sm font-black text-neutral-900">Choose Workspace Publishing Engine</h3>
+            <p className="text-xs text-neutral-500 max-w-2xl leading-relaxed">
+              Bypass monthly Developer API charges ($100+/mo for X) and complex Meta business applications. We've built a zero-cost intent engine that automates copying and launches pre-filled draft composers in 1 click!
+            </p>
+          </div>
+          
+          <div className="flex bg-neutral-100 p-1 rounded-xl border border-neutral-200 self-start sm:self-center shrink-0">
+            <button
+              onClick={() => setPublishingMode('zero_cost')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                publishingMode === 'zero_cost'
+                  ? 'bg-white text-neutral-900 shadow-sm border border-neutral-200 font-extrabold'
+                  : 'text-neutral-500 hover:text-neutral-800'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5 text-purple-700" />
+              <span>Zero-Cost Mode</span>
+            </button>
+            <button
+              onClick={() => setPublishingMode('direct_api')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                publishingMode === 'direct_api'
+                  ? 'bg-white text-neutral-900 shadow-sm border border-neutral-200 font-extrabold'
+                  : 'text-neutral-500 hover:text-neutral-800'
+              }`}
+            >
+              <Key className="w-3.5 h-3.5 text-neutral-500" />
+              <span>Direct API (Paid)</span>
+            </button>
           </div>
         </div>
       </div>
@@ -1240,6 +1375,83 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
         </div>
       </div>
 
+      {/* CAMPAIGN IDENTITY INTEGRATION & TARGET PROFILE */}
+      <div className="bg-white border border-neutral-200 rounded-xl p-5 shadow-sm space-y-4">
+        <div className="flex items-center gap-2">
+          <ShieldCheck className="w-5 h-5 text-neutral-800" />
+          <h3 className="text-sm font-extrabold text-neutral-900 uppercase tracking-tight">Campaign Profile & Session Sync</h3>
+        </div>
+        
+        <p className="text-xs text-neutral-500 leading-relaxed">
+          The Campaign Target Account dictates how recipes, reward receipts, and automated dispatches are watermarked. Update the field below to customize your active board target, or connect your <strong>X (Twitter)</strong> profile via Quick-Link to synchronize bidirectionally.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-5 items-center pt-2">
+          {/* Active Campaign Card Display */}
+          <div className="md:col-span-7 bg-neutral-50 border border-neutral-200/80 rounded-xl p-4 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 bg-neutral-900 rounded-xl flex items-center justify-center text-white text-base font-black shadow-sm">
+                𝕏
+              </div>
+              <div className="space-y-0.5">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-black text-neutral-900">@{campaignData?.meta?.account || 'unlinked'}</span>
+                  <span className={`inline-flex items-center justify-center text-[8px] font-bold px-1.5 py-0.5 rounded-full font-mono ${connections['x']?.connected ? 'bg-green-100 text-green-800 border border-green-200/30' : 'bg-neutral-200 text-neutral-600'}`}>
+                    {connections['x']?.connected ? '✓ Verified Link' : 'Draft Mode'}
+                  </span>
+                </div>
+                <div className="text-[10px] text-neutral-400 font-mono flex items-center gap-1">
+                  <span>Owner Session: ee.ee455@gmail.com</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="text-right">
+              <span className="text-[9px] text-neutral-400 font-bold block uppercase font-mono">Sync Status</span>
+              {connections['x']?.connected ? (
+                <span className="text-[10px] text-green-700 font-bold flex items-center gap-1 justify-end">
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                  Connected to X
+                </span>
+              ) : (
+                <span className="text-[10px] text-neutral-400 font-medium">Unlinked Draft</span>
+              )}
+            </div>
+          </div>
+
+          {/* Direct Input Customization */}
+          <div className="md:col-span-5 space-y-1.5">
+            <label className="block text-[10px] font-bold text-neutral-500 uppercase tracking-wider font-mono">
+              Customize Target Account Handle
+            </label>
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400 text-xs font-bold font-mono">@</span>
+              <input 
+                type="text"
+                className="w-full pl-7 pr-3 py-2.5 bg-white border border-neutral-200 rounded-lg text-xs font-bold text-neutral-900 focus:outline-none focus:ring-1 focus:ring-neutral-950 placeholder-neutral-400"
+                value={campaignData?.meta?.account || ''}
+                onChange={(e) => {
+                  if (onUpdateCampaignData) {
+                    const rawVal = e.target.value.replace(/^@/, '');
+                    onUpdateCampaignData({
+                      ...campaignData,
+                      meta: {
+                        ...campaignData.meta,
+                        account: rawVal
+                      }
+                    });
+                  }
+                }}
+                placeholder="r_comic_book"
+              />
+            </div>
+            <p className="text-[9px] text-neutral-400 leading-normal">
+              Direct edits instantly propagate to all scheduler headers and ledger templates.
+            </p>
+          </div>
+        </div>
+      </div>
+
       {/* SECTION 2: Bento Grid of Channels */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
         {PLATFORMS.map((platform) => {
@@ -1287,7 +1499,11 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
                 {state.connected && (
                   <div className="mt-2 text-[10px]">
-                    {hasDirectKeys ? (
+                    {publishingMode === 'zero_cost' ? (
+                      <span className="text-purple-700 font-extrabold flex items-center gap-1">
+                        🚀 Zero-Cost Helper Active
+                      </span>
+                    ) : hasDirectKeys ? (
                       <span className="text-purple-700 font-black flex items-center gap-1">
                         ⚡ Direct API Active
                       </span>
