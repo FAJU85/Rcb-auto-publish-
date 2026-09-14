@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Share2, Check, RefreshCw, Key, Link2, LogOut, Terminal, 
@@ -266,14 +266,19 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
   // Autonomous Scheduler state
   const [isAutonomousActive, setIsAutonomousActive] = useState<boolean>(false);
-  const [simSpeed, setSimSpeed] = useState<number>(6); // seconds per post
+  const [schedulerMode, setSchedulerMode] = useState<'realtime' | 'timemachine'>('timemachine');
+  const [realTimeClock, setRealTimeClock] = useState<string>('');
+  const [timeMachineWeek, setTimeMachineWeek] = useState<number>(1);
+  const [timeMachineDay, setTimeMachineDay] = useState<number>(1);
+  const [timeMachineTime, setTimeMachineTime] = useState<string>('00:00');
+  const [simSpeed, setSimSpeed] = useState<number>(6); // fallback seconds per post
   const [simProgress, setSimProgress] = useState<number>(0);
   const [autoConsoleLogs, setAutoConsoleLogs] = useState<string[]>([
     `[${new Date().toLocaleTimeString()}] Autonomous publishing subsystem initialized. Status: INACTIVE.`
   ]);
 
-  // Find all pending posts across all weeks and days
-  const getPendingPosts = (): { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }[] => {
+  // Find all pending posts across all weeks and days (Memoized to prevent reference-equality interval restarts)
+  const pendingPosts = useMemo(() => {
     const list: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }[] = [];
     campaignData.weeks.forEach(wk => {
       wk.days.forEach(dy => {
@@ -290,10 +295,10 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       });
     });
     return list;
-  };
+  }, [campaignData]);
 
-  const pendingPosts = getPendingPosts();
   const nextTarget = pendingPosts[0] || null;
+  const nextTargetId = nextTarget?.post.id || '';
 
   // Autonomous posting execution handler
   const triggerAutoPublish = async (target: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }) => {
@@ -353,23 +358,30 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       ...prev
     ]);
 
-    // Update campaign state
+    // Update campaign state immutably
     if (onUpdateCampaignData) {
-      const updatedCampaign = { ...campaignData };
-      const weekObj = updatedCampaign.weeks.find(w => w.week === weekNum);
-      const dayObj = weekObj?.days.find(d => d.day === dayNum);
-      if (dayObj) {
-        if (isFloat) {
-          dayObj.floats = dayObj.floats.map(f => 
-            f.id === post.id ? { ...f, isPublished: true, publishedAt: new Date().toISOString() } : f
-          );
-        } else {
-          dayObj.posts = dayObj.posts.map(p => 
-            p.id === post.id ? { ...p, isPublished: true, publishedAt: new Date().toISOString() } : p
-          );
-        }
-        onUpdateCampaignData(updatedCampaign);
-      }
+      const updatedCampaign = {
+        ...campaignData,
+        weeks: campaignData.weeks.map(w => {
+          if (w.week !== weekNum) return w;
+          return {
+            ...w,
+            days: w.days.map(d => {
+              if (d.day !== dayNum) return d;
+              return {
+                ...d,
+                posts: isFloat 
+                  ? d.posts 
+                  : d.posts.map(p => p.id === post.id ? { ...p, isPublished: true, publishedAt: new Date().toISOString() } : p),
+                floats: isFloat
+                  ? d.floats.map(f => f.id === post.id ? { ...f, isPublished: true, publishedAt: new Date().toISOString() } : f)
+                  : d.floats
+              };
+            })
+          };
+        })
+      };
+      onUpdateCampaignData(updatedCampaign);
     }
 
     // Trigger ledger reward entries
@@ -429,6 +441,18 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     ]);
   };
 
+  // Sync Time Machine clock to the upcoming post's day start when activated
+  useEffect(() => {
+    if (isAutonomousActive && nextTarget) {
+      if (schedulerMode === 'timemachine') {
+        setTimeMachineWeek(nextTarget.weekNum);
+        setTimeMachineDay(nextTarget.dayNum);
+        setTimeMachineTime('00:00');
+        setSimProgress(0);
+      }
+    }
+  }, [isAutonomousActive, schedulerMode]);
+
   useEffect(() => {
     if (!isAutonomousActive) {
       setSimProgress(0);
@@ -445,26 +469,94 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       return;
     }
 
-    const tickIntervalMs = 200;
-    const totalDurationMs = simSpeed * 1000;
-    const increment = (tickIntervalMs / totalDurationMs) * 100;
+    if (schedulerMode === 'realtime') {
+      // --- REALTIME MODE: FOLLOW REAL WALL-CLOCK SCHEDULE ---
+      const timer = setInterval(() => {
+        const now = new Date();
+        const curHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+        const curSec = now.getSeconds();
+        
+        setRealTimeClock(now.toLocaleTimeString());
 
-    let currentProgress = 0;
-    const timer = setInterval(() => {
-      currentProgress += increment;
-      if (currentProgress >= 100) {
-        clearInterval(timer);
-        setSimProgress(0);
-        setTimeout(() => {
+        // Target scheduled time
+        const targetTimeStr = nextTarget.post.time || '12:00';
+        
+        // Progress within the current minute (nice visual countdown bar)
+        setSimProgress((curSec / 60) * 100);
+
+        if (curHHMM === targetTimeStr) {
           triggerAutoPublish(nextTarget);
-        }, 0);
-      } else {
-        setSimProgress(currentProgress);
-      }
-    }, tickIntervalMs);
+        }
+      }, 1000);
 
-    return () => clearInterval(timer);
-  }, [isAutonomousActive, nextTarget, simSpeed]);
+      return () => clearInterval(timer);
+    } else {
+      // --- TIMEMACHINE MODE: FAST TIME-WARP CHRONOLOGICAL SCHEDULE ---
+      // Tick every 150ms to simulate the fast passage of time
+      // Advance by 10 minutes per tick. (1 hour in 900ms, 1 full day in 21.6s)
+      const tickDeltaMins = 10;
+      
+      let currentMins = (() => {
+        const [h, m] = timeMachineTime.split(':').map(Number);
+        return h * 60 + m;
+      })();
+      
+      let currentDay = timeMachineDay;
+      let currentWeek = timeMachineWeek;
+
+      const timer = setInterval(() => {
+        // Advance clock minutes
+        let nextMins = currentMins + tickDeltaMins;
+        if (nextMins >= 1440) {
+          nextMins = nextMins % 1440;
+          currentDay += 1;
+          if (currentDay > 7) {
+            currentDay = 1;
+            currentWeek += 1;
+          }
+        }
+
+        currentMins = nextMins;
+        const nextHour = Math.floor(nextMins / 60);
+        const nextMin = nextMins % 60;
+        const timeStr = `${String(nextHour).padStart(2, '0')}:${String(nextMin).padStart(2, '0')}`;
+        
+        setTimeMachineTime(timeStr);
+        setTimeMachineDay(currentDay);
+        setTimeMachineWeek(currentWeek);
+
+        // Get target's scheduled time
+        const targetTimeStr = nextTarget.post.time || '12:00';
+        const [targetHour, targetMin] = targetTimeStr.split(':').map(Number);
+        const targetMins = targetHour * 60 + targetMin;
+
+        if (currentWeek === nextTarget.weekNum && currentDay === nextTarget.dayNum) {
+          // Calculate progress percentage of the day to reach target time
+          const progress = Math.min(100, Math.max(0, (currentMins / targetMins) * 100));
+          setSimProgress(progress);
+
+          // Trigger if we hit or cross the target time
+          if (currentMins >= targetMins) {
+            clearInterval(timer);
+            setSimProgress(100);
+            setTimeout(() => {
+              triggerAutoPublish(nextTarget);
+            }, 100);
+          }
+        } else if (currentWeek < nextTarget.weekNum || (currentWeek === nextTarget.weekNum && currentDay < nextTarget.dayNum)) {
+          // Still traveling to the target day
+          setSimProgress((currentMins / 1440) * 100);
+        } else {
+          // Time-machine is ahead of target day, immediately dispatch to catch up
+          clearInterval(timer);
+          triggerAutoPublish(nextTarget);
+        }
+
+      }, 150);
+
+      return () => clearInterval(timer);
+    }
+  }, [isAutonomousActive, nextTargetId, schedulerMode, timeMachineWeek, timeMachineDay, timeMachineTime]);
 
   // Sync draft area text with active post if changed
   useEffect(() => {
@@ -1019,25 +1111,65 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
               </div>
             </div>
 
-            {/* Time Slider */}
-            <div className="space-y-1.5">
-              <div className="flex justify-between text-xs font-medium text-neutral-700">
-                <span>Simulation Dispatch Rate:</span>
-                <span className="font-mono font-bold text-neutral-900">{simSpeed}s / post</span>
+            {/* Scheduler Mode Selection */}
+            <div className="space-y-2">
+              <span className="text-[10px] text-neutral-400 font-bold uppercase tracking-wider font-mono block">Scheduler Engine Mode</span>
+              <div className="grid grid-cols-2 gap-1 p-1 bg-neutral-100 rounded-lg border border-neutral-200">
+                <button
+                  type="button"
+                  onClick={() => setSchedulerMode('timemachine')}
+                  disabled={isAutonomousActive}
+                  className={`py-1.5 px-2 text-[11px] font-bold rounded-md transition-all ${
+                    schedulerMode === 'timemachine'
+                      ? 'bg-white text-neutral-950 shadow-sm'
+                      : 'text-neutral-500 hover:text-neutral-800 disabled:opacity-50'
+                  }`}
+                >
+                  ⏳ Time-Machine (Fast)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSchedulerMode('realtime')}
+                  disabled={isAutonomousActive}
+                  className={`py-1.5 px-2 text-[11px] font-bold rounded-md transition-all ${
+                    schedulerMode === 'realtime'
+                      ? 'bg-white text-neutral-950 shadow-sm'
+                      : 'text-neutral-500 hover:text-neutral-800 disabled:opacity-50'
+                  }`}
+                >
+                  ⏰ Real-Time Clock
+                </button>
               </div>
-              <input
-                type="range"
-                min="3"
-                max="30"
-                step="1"
-                value={simSpeed}
-                onChange={(e) => setSimSpeed(Number(e.target.value))}
-                disabled={isAutonomousActive}
-                className="w-full accent-neutral-900 cursor-pointer disabled:opacity-50"
-              />
-              <p className="text-[10px] text-neutral-400 leading-snug">
-                Adjust how fast the background scheduler completes the campaign posts sequence.
-              </p>
+            </div>
+
+            {/* Dynamic Clock and Time Display */}
+            <div className="p-3 bg-neutral-100 rounded-lg border border-neutral-200 text-xs space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-neutral-400 uppercase font-black font-mono">Current Engine Clock:</span>
+                {isAutonomousActive && (
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-ping" />
+                )}
+              </div>
+              
+              {schedulerMode === 'realtime' ? (
+                <div className="space-y-1">
+                  <div className="font-mono font-extrabold text-neutral-900 text-sm flex items-center gap-1.5">
+                    <span>🕒 {realTimeClock || new Date().toLocaleTimeString()}</span>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 leading-snug">
+                    Running in background. Monitoring system clock for slot times.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  <div className="font-mono font-extrabold text-neutral-900 text-sm flex items-center gap-1.5">
+                    <span>📅 Week {timeMachineWeek} Day {timeMachineDay} • {timeMachineTime}</span>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 leading-snug">
+                    Time-machine warp: 1 campaign hour passes every 900ms.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Dynamic visual progress loader bar */}
