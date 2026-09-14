@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Share2, Check, RefreshCw, Key, Link2, LogOut, Terminal, ShieldCheck,
@@ -272,18 +272,116 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     localStorage.setItem('campaign_publish_logs', JSON.stringify(auditLogs));
   }, [auditLogs]);
 
-  // Autonomous Scheduler state
-  const [isAutonomousActive, setIsAutonomousActive] = useState<boolean>(false);
-  const [schedulerMode, setSchedulerMode] = useState<'realtime' | 'timemachine'>('timemachine');
+  // Autonomous Scheduler state with local storage persistence
+  const [isAutonomousActive, setIsAutonomousActive] = useState<boolean>(() => {
+    return localStorage.getItem('campaign_autonomous_active') === 'true';
+  });
+  const [schedulerMode, setSchedulerMode] = useState<'realtime' | 'timemachine'>(() => {
+    return (localStorage.getItem('campaign_scheduler_mode') as 'realtime' | 'timemachine') || 'timemachine';
+  });
   const [realTimeClock, setRealTimeClock] = useState<string>('');
-  const [timeMachineWeek, setTimeMachineWeek] = useState<number>(1);
-  const [timeMachineDay, setTimeMachineDay] = useState<number>(1);
-  const [timeMachineTime, setTimeMachineTime] = useState<string>('00:00');
+  const [timeMachineWeek, setTimeMachineWeek] = useState<number>(() => {
+    return Number(localStorage.getItem('campaign_time_machine_week')) || 1;
+  });
+  const [timeMachineDay, setTimeMachineDay] = useState<number>(() => {
+    return Number(localStorage.getItem('campaign_time_machine_day')) || 1;
+  });
+  const [timeMachineTime, setTimeMachineTime] = useState<string>(() => {
+    return localStorage.getItem('campaign_time_machine_time') || '00:00';
+  });
   const [simSpeed, setSimSpeed] = useState<number>(6); // fallback seconds per post
   const [simProgress, setSimProgress] = useState<number>(0);
   const [autoConsoleLogs, setAutoConsoleLogs] = useState<string[]>([
-    `[${new Date().toLocaleTimeString()}] Autonomous publishing subsystem initialized. Status: INACTIVE.`
+    `[${new Date().toLocaleTimeString()}] Autonomous publishing subsystem initialized. Status: ${localStorage.getItem('campaign_autonomous_active') === 'true' ? 'ACTIVE' : 'INACTIVE'}.`
   ]);
+
+  // Track previous active state to distinguish manual toggles
+  const prevActiveRef = useRef<boolean>(isAutonomousActive);
+  useEffect(() => {
+    prevActiveRef.current = isAutonomousActive;
+  }, [isAutonomousActive]);
+
+  // Sync state values to localStorage on state changes
+  useEffect(() => {
+    localStorage.setItem('campaign_autonomous_active', isAutonomousActive ? 'true' : 'false');
+  }, [isAutonomousActive]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_scheduler_mode', schedulerMode);
+  }, [schedulerMode]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_time_machine_week', String(timeMachineWeek));
+  }, [timeMachineWeek]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_time_machine_day', String(timeMachineDay));
+  }, [timeMachineDay]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_time_machine_time', timeMachineTime);
+  }, [timeMachineTime]);
+
+  // Update heartbeat whenever active scheduler coordinates advance
+  useEffect(() => {
+    if (isAutonomousActive) {
+      localStorage.setItem('campaign_scheduler_heartbeat', String(Date.now()));
+    }
+  }, [isAutonomousActive, timeMachineWeek, timeMachineDay, timeMachineTime, realTimeClock]);
+
+  // Offline catch-up engine: when user returns or reopens the browser
+  useEffect(() => {
+    if (isAutonomousActive) {
+      const lastHeartbeat = localStorage.getItem('campaign_scheduler_heartbeat');
+      if (lastHeartbeat) {
+        const elapsedRealMs = Date.now() - Number(lastHeartbeat);
+        if (elapsedRealMs > 5000) { // Off for more than 5 seconds
+          if (schedulerMode === 'realtime') {
+            setAutoConsoleLogs(prev => [
+              `[${new Date().toLocaleTimeString()}] 🔌 Reconnected! Real-time autonomous scheduler synchronized.`,
+              ...prev
+            ]);
+          } else {
+            // Time-Machine Catch-Up calculation
+            // Tick interval is 150ms per 10 simulated minutes.
+            const elapsedSimMins = Math.floor((elapsedRealMs / 150) * 10);
+            if (elapsedSimMins > 0) {
+              let currentMins = (() => {
+                const [h, m] = timeMachineTime.split(':').map(Number);
+                return h * 60 + m;
+              })();
+              
+              let currentDay = timeMachineDay;
+              let currentWeek = timeMachineWeek;
+              
+              let advancedMins = currentMins + elapsedSimMins;
+              let dayOverflow = Math.floor(advancedMins / 1440);
+              advancedMins = advancedMins % 1440;
+              
+              currentDay += dayOverflow;
+              while (currentDay > 7) {
+                currentDay -= 7;
+                currentWeek += 1;
+              }
+              
+              const nextHour = Math.floor(advancedMins / 60);
+              const nextMin = advancedMins % 60;
+              const nextTimeStr = `${String(nextHour).padStart(2, '0')}:${String(nextMin).padStart(2, '0')}`;
+              
+              setTimeMachineTime(nextTimeStr);
+              setTimeMachineDay(currentDay);
+              setTimeMachineWeek(currentWeek);
+              
+              setAutoConsoleLogs(prev => [
+                `[${new Date().toLocaleTimeString()}] 🔌 Campaign Sync Catch-Up: Simulated ${elapsedSimMins} minutes passed while offline. Time machine advanced to Week ${currentWeek} Day ${currentDay} ${nextTimeStr}.`,
+                ...prev
+              ]);
+            }
+          }
+        }
+      }
+    }
+  }, []); // Run once on component mount
 
   // Find all pending posts across all weeks and days (Memoized to prevent reference-equality interval restarts)
   const pendingPosts = useMemo(() => {
@@ -449,9 +547,10 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     ]);
   };
 
-  // Sync Time Machine clock to the upcoming post's day start when activated
+  // Sync Time Machine clock to the upcoming post's day start when activated manually
   useEffect(() => {
-    if (isAutonomousActive && nextTarget) {
+    const wasInactive = !prevActiveRef.current;
+    if (isAutonomousActive && nextTarget && wasInactive) {
       if (schedulerMode === 'timemachine') {
         setTimeMachineWeek(nextTarget.weekNum);
         setTimeMachineDay(nextTarget.dayNum);
@@ -459,7 +558,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
         setSimProgress(0);
       }
     }
-  }, [isAutonomousActive, schedulerMode]);
+  }, [isAutonomousActive, schedulerMode, nextTarget]);
 
   useEffect(() => {
     if (!isAutonomousActive) {
