@@ -383,6 +383,77 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     }
   }, []); // Run once on component mount
 
+  // 1. Initial Load: Fetch latest server-side scheduler state
+  useEffect(() => {
+    const loadServerState = async () => {
+      try {
+        const res = await fetch('/api/scheduler/state');
+        if (res.ok) {
+          const serverData = await res.json();
+          // Synchronize server-side active scheduler parameters
+          if (serverData.isAutonomousActive || serverData.campaignData) {
+            setIsAutonomousActive(serverData.isAutonomousActive);
+            setSchedulerMode(serverData.schedulerMode);
+            setTimeMachineWeek(serverData.timeMachineWeek);
+            setTimeMachineDay(serverData.timeMachineDay);
+            setTimeMachineTime(serverData.timeMachineTime);
+            
+            if (serverData.campaignData && onUpdateCampaignData) {
+              onUpdateCampaignData(serverData.campaignData);
+            }
+            if (serverData.auditLogs && serverData.auditLogs.length > 0) {
+              setAuditLogs(serverData.auditLogs);
+            }
+            if (serverData.autoConsoleLogs && serverData.autoConsoleLogs.length > 0) {
+              setAutoConsoleLogs(serverData.autoConsoleLogs);
+            }
+            if (serverData.ledgerEntries && serverData.ledgerEntries.length > 0 && onAddLedgerEntry) {
+              serverData.ledgerEntries.forEach((entry: any) => {
+                onAddLedgerEntry(entry);
+              });
+              // Clear server ledger entries queue so we don't double-add them on next mounts
+              await fetch('/api/scheduler/state', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ledgerEntries: [] })
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Failed to load server state:', err);
+      }
+    };
+    loadServerState();
+  }, []); // Run once on component mount
+
+  // 2. Continuous Synchronization: Push scheduler changes to the server
+  useEffect(() => {
+    const syncToServer = async () => {
+      try {
+        await fetch('/api/scheduler/state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            isAutonomousActive,
+            schedulerMode,
+            timeMachineWeek,
+            timeMachineDay,
+            timeMachineTime,
+            campaignData,
+            auditLogs,
+            autoConsoleLogs
+          })
+        });
+      } catch (err) {
+        console.error('Failed to sync scheduler to server:', err);
+      }
+    };
+
+    const timeout = setTimeout(syncToServer, 500);
+    return () => clearTimeout(timeout);
+  }, [isAutonomousActive, schedulerMode, timeMachineWeek, timeMachineDay, timeMachineTime, campaignData, auditLogs, autoConsoleLogs]);
+
   // Find all pending posts across all weeks and days (Memoized to prevent reference-equality interval restarts)
   const pendingPosts = useMemo(() => {
     const list: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }[] = [];

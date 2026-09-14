@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Calendar, Activity, ShieldCheck, HelpCircle, Flame, Sparkles, CheckSquare, Award } from 'lucide-react';
 import { initialCampaignData } from './data/campaign';
 import { CampaignData, LedgerEntry, Post, FloatPost } from './types';
@@ -44,8 +44,28 @@ const defaultLedgerEntries: LedgerEntry[] = [
 ];
 
 export default function App() {
-  const [campaign, setCampaign] = useState<CampaignData>(initialCampaignData);
-  const [ledger, setLedger] = useState<LedgerEntry[]>(defaultLedgerEntries);
+  const [campaign, setCampaign] = useState<CampaignData>(() => {
+    const saved = localStorage.getItem('campaign_planner_data');
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) { console.error(e); }
+    }
+    return initialCampaignData;
+  });
+  const [ledger, setLedger] = useState<LedgerEntry[]>(() => {
+    const saved = localStorage.getItem('campaign_ledger_entries');
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) { console.error(e); }
+    }
+    return defaultLedgerEntries;
+  });
+
+  useEffect(() => {
+    localStorage.setItem('campaign_planner_data', JSON.stringify(campaign));
+  }, [campaign]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_ledger_entries', JSON.stringify(ledger));
+  }, [ledger]);
   const [activeTab, setActiveTab] = useState<'schedule' | 'analytics' | 'ledger' | 'ethics' | 'integrations' | 'ai_prompts'>('schedule');
   const [activeWeek, setActiveWeek] = useState<number>(1);
 
