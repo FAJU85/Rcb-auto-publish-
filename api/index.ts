@@ -139,6 +139,30 @@ const circuitBreaker = new CircuitBreaker();
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+function isNonRetryableError(error: any): boolean {
+  if (!error) return false;
+  if (error.isAuthError) return true;
+  const status = error.status || error.statusCode;
+  if (status === 400 || status === 401 || status === 403 || status === 422) return true;
+
+  const msg = (error.message || String(error)).toLowerCase();
+  if (
+    msg.includes("invalid identifier or password") ||
+    msg.includes("invalid identifier") ||
+    msg.includes("invalid password") ||
+    msg.includes("unauthorized") ||
+    msg.includes("forbidden") ||
+    msg.includes("authentication") ||
+    msg.includes("bad credentials") ||
+    msg.includes("invalid api key") ||
+    msg.includes("could not authenticate") ||
+    msg.includes("missing required")
+  ) {
+    return true;
+  }
+  return false;
+}
+
 async function executeWithRetry<T>(
   action: () => Promise<T>,
   platformId: string,
@@ -149,7 +173,11 @@ async function executeWithRetry<T>(
   while (true) {
     try {
       return await action();
-    } catch (error) {
+    } catch (error: any) {
+      // Fast-fail immediately on non-retryable errors (such as authentication or bad credentials)
+      if (isNonRetryableError(error)) {
+        throw error;
+      }
       if (attempt >= maxAttempts) {
         throw error;
       }
@@ -214,7 +242,10 @@ app.post("/api/publish", async (req, res) => {
         circuitBreaker.onSuccess(platformId);
         return result;
       } catch (err: any) {
-        circuitBreaker.onFailure(platformId);
+        // Do NOT trip circuit breaker on user/client credential errors (e.g. invalid password)
+        if (!isNonRetryableError(err)) {
+          circuitBreaker.onFailure(platformId);
+        }
         throw err;
       }
     };
@@ -283,8 +314,14 @@ app.post("/api/publish", async (req, res) => {
 
     // 2. Direct Bluesky ATProtocol Feed Dispatch
     if (platformId === "bluesky") {
-      const handle = credentials.handle;
-      const password = credentials.password;
+      let handle = (credentials.handle || '').trim();
+      let password = (credentials.password || '').trim();
+
+      // Normalize handle if user included leading '@'
+      if (handle.startsWith('@')) {
+        handle = handle.substring(1).trim();
+      }
+
       if (!handle || !password) {
         return res.json({ status: "SUCCESS", real: false, note: "Draft prepared for manual dispatch (missing Bluesky login details)." });
       }
@@ -299,7 +336,15 @@ app.post("/api/publish", async (req, res) => {
 
         if (!sessResponse.ok) {
           const sData = await sessResponse.json().catch(() => ({}));
-          throw new Error(sData.message || "Bluesky authentication session initialization failed.");
+          const rawMsg = sData.message || "Bluesky authentication session initialization failed.";
+          let friendlyMsg = rawMsg;
+          if (rawMsg.toLowerCase().includes("invalid identifier or password")) {
+            friendlyMsg = "Invalid identifier or password. Please verify your Bluesky handle and App Password (create in bsky.app Settings > Privacy and Security > App Passwords).";
+          }
+          const authErr: any = new Error(friendlyMsg);
+          authErr.status = sessResponse.status;
+          authErr.isAuthError = true;
+          throw authErr;
         }
 
         const session = await sessResponse.json();
@@ -323,7 +368,12 @@ app.post("/api/publish", async (req, res) => {
 
         if (!recordResponse.ok) {
           const rData = await recordResponse.json().catch(() => ({}));
-          throw new Error(rData.message || "Bluesky post record creation failed.");
+          const recErr: any = new Error(rData.message || "Bluesky post record creation failed.");
+          recErr.status = recordResponse.status;
+          if (recordResponse.status === 400 || recordResponse.status === 401 || recordResponse.status === 403) {
+            recErr.isAuthError = true;
+          }
+          throw recErr;
         }
       });
 
@@ -390,6 +440,17 @@ app.post("/api/publish", async (req, res) => {
     // 5. Normal queue simulation fallback if credentials are empty
     return res.json({ status: "SUCCESS", real: false });
   } catch (error: any) {
+    const isAuth = isNonRetryableError(error);
+    if (isAuth) {
+      console.warn(`[Publish Auth] ${platformId.toUpperCase()} authentication rejected: ${error.message}`);
+      return res.status(401).json({ 
+        status: "FAILED", 
+        error: error.message || `Authentication failed for ${platformId}`,
+        isAuthError: true,
+        real: true 
+      });
+    }
+
     console.error("Server API Publish Error:", error);
     return res.status(500).json({ 
       status: "FAILED", 
@@ -400,12 +461,78 @@ app.post("/api/publish", async (req, res) => {
 });
 
 // ==========================================
+// CREDENTIALS VERIFICATION ENDPOINT
+// ==========================================
+app.post("/api/verify-credentials", async (req, res) => {
+  const { platformId, credentials = {} } = req.body;
+  if (!platformId) return res.status(400).json({ valid: false, error: "Missing platformId" });
+
+  try {
+    if (platformId === "bluesky") {
+      let handle = (credentials.handle || '').trim();
+      let password = (credentials.password || '').trim();
+      if (handle.startsWith('@')) handle = handle.substring(1).trim();
+
+      if (!handle || !password) {
+        return res.json({ valid: false, error: "Please enter both your Bluesky Handle and App Password." });
+      }
+
+      const sessionUrl = "https://bsky.social/xrpc/com.atproto.server.createSession";
+      const sessResponse = await fetch(sessionUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identifier: handle, password })
+      });
+
+      if (!sessResponse.ok) {
+        const sData = await sessResponse.json().catch(() => ({}));
+        const rawMsg = sData.message || `Bluesky auth rejected (HTTP ${sessResponse.status})`;
+        if (rawMsg.toLowerCase().includes("invalid identifier or password")) {
+          return res.json({
+            valid: false,
+            error: "Invalid identifier or password. Make sure to use your Bluesky handle (e.g. yourhandle.bsky.social) and an App Password created in bsky.app Settings > Privacy and Security > App Passwords."
+          });
+        }
+        return res.json({ valid: false, error: rawMsg });
+      }
+
+      const sData = await sessResponse.json();
+      return res.json({
+        valid: true,
+        message: `Connected successfully as @${sData.handle || handle}!`
+      });
+    }
+
+    if (platformId === "telegram") {
+      const botToken = (credentials.botToken || '').trim();
+      if (!botToken) return res.json({ valid: false, error: "Missing Bot Token." });
+      const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+      const tgData = await tgRes.json().catch(() => ({}));
+      if (tgData.ok) {
+        return res.json({ valid: true, message: `Connected as @${tgData.result?.username || 'Bot'}` });
+      } else {
+        return res.json({ valid: false, error: tgData.description || "Invalid Telegram Bot Token" });
+      }
+    }
+
+    if (credentials.webhookUrl) {
+      return res.json({ valid: true, message: "Webhook endpoint configured." });
+    }
+
+    return res.json({ valid: true, message: "Parameters saved." });
+  } catch (err: any) {
+    return res.json({ valid: false, error: err.message || "Verification request failed" });
+  }
+});
+
+// ==========================================
 // SERVER-SIDE BACKGROUND SCHEDULER ENGINE
 // ==========================================
 
 interface ServerSchedulerState {
   isAutonomousActive: boolean;
   schedulerMode: 'realtime' | 'timemachine';
+  realTimeCadence?: 'slot_time' | '15s' | '30s' | '1m' | '5m';
   timeMachineWeek: number;
   timeMachineDay: number;
   timeMachineTime: string;
@@ -415,11 +542,13 @@ interface ServerSchedulerState {
   ledgerEntries: any[];
   publishedPostIds: string[];
   lastTickTimestamp: number;
+  lastPublishTimestamp?: number;
 }
 
 let serverState: ServerSchedulerState = {
   isAutonomousActive: false,
   schedulerMode: 'timemachine',
+  realTimeCadence: 'slot_time',
   timeMachineWeek: 1,
   timeMachineDay: 1,
   timeMachineTime: '00:00',
@@ -428,7 +557,8 @@ let serverState: ServerSchedulerState = {
   autoConsoleLogs: [],
   ledgerEntries: [],
   publishedPostIds: [],
-  lastTickTimestamp: Date.now()
+  lastTickTimestamp: Date.now(),
+  lastPublishTimestamp: 0
 };
 
 let serverInterval: NodeJS.Timeout | null = null;
@@ -586,12 +716,31 @@ function startServerScheduler() {
     }
 
     if (serverState.schedulerMode === 'realtime') {
-      const dateObj = new Date();
-      const curHHMM = `${String(dateObj.getHours()).padStart(2, '0')}:${String(dateObj.getMinutes()).padStart(2, '0')}`;
-      const targetTimeStr = nextTarget.post.time || '12:00';
-      
-      if (curHHMM === targetTimeStr) {
-        publishOnServer(nextTarget);
+      const nowMs = Date.now();
+      const lastPublish = serverState.lastPublishTimestamp || 0;
+      const cadence = serverState.realTimeCadence || 'slot_time';
+
+      if (cadence === 'slot_time') {
+        const dateObj = new Date();
+        const curMins = dateObj.getHours() * 60 + dateObj.getMinutes();
+        const targetTimeStr = nextTarget.post.time || '12:00';
+        const [targetHour, targetMin] = targetTimeStr.split(':').map(Number);
+        const targetMins = (isNaN(targetHour) ? 12 : targetHour) * 60 + (isNaN(targetMin) ? 0 : targetMin);
+
+        // Due check: If current wall-clock minutes is >= target scheduled time, and cooldown passed
+        const isDue = curMins >= targetMins;
+        const cooldownOk = nowMs - lastPublish >= 4000;
+
+        if (isDue && cooldownOk) {
+          serverState.lastPublishTimestamp = nowMs;
+          publishOnServer(nextTarget);
+        }
+      } else {
+        const intervalMs = cadence === '15s' ? 15000 : cadence === '30s' ? 30000 : cadence === '1m' ? 60000 : 300000;
+        if (nowMs - lastPublish >= intervalMs) {
+          serverState.lastPublishTimestamp = nowMs;
+          publishOnServer(nextTarget);
+        }
       }
     } else {
       // Time-machine mode:
@@ -655,6 +804,7 @@ app.post("/api/scheduler/state", (req, res) => {
   const { 
     isAutonomousActive, 
     schedulerMode, 
+    realTimeCadence,
     timeMachineWeek, 
     timeMachineDay, 
     timeMachineTime, 
@@ -667,6 +817,7 @@ app.post("/api/scheduler/state", (req, res) => {
 
   if (isAutonomousActive !== undefined) serverState.isAutonomousActive = isAutonomousActive;
   if (schedulerMode !== undefined) serverState.schedulerMode = schedulerMode;
+  if (realTimeCadence !== undefined) serverState.realTimeCadence = realTimeCadence;
   if (timeMachineWeek !== undefined) serverState.timeMachineWeek = timeMachineWeek;
   if (timeMachineDay !== undefined) serverState.timeMachineDay = timeMachineDay;
   if (timeMachineTime !== undefined) serverState.timeMachineTime = timeMachineTime;

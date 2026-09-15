@@ -2,7 +2,8 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Share2, Check, RefreshCw, Key, Link2, LogOut, Terminal, ShieldCheck,
-  Send, AlertCircle, Sparkles, Sliders, ChevronDown, CheckCircle2, XCircle
+  Send, AlertCircle, Sparkles, Sliders, ChevronDown, CheckCircle2, XCircle,
+  Zap, Clock
 } from 'lucide-react';
 import { CampaignData, Post, FloatPost, LedgerEntry } from '../types';
 
@@ -128,8 +129,8 @@ const PLATFORMS: Platform[] = [
     authUrl: 'https://bsky.app',
     docUrl: 'https://docs.bsky.app',
     fields: [
-      { name: 'Handle / Email', key: 'handle', type: 'text', placeholder: 'username.bsky.social', description: 'Your Bluesky identifier handle' },
-      { name: 'App Password', key: 'password', type: 'password', placeholder: 'xxxx-xxxx-xxxx-xxxx', description: 'Generated in Bluesky Settings > App Passwords' },
+      { name: 'Handle / Email', key: 'handle', type: 'text', placeholder: 'username.bsky.social', description: 'Your full Bluesky handle (e.g. username.bsky.social, without @) or email address' },
+      { name: 'App Password', key: 'password', type: 'password', placeholder: 'xxxx-xxxx-xxxx-xxxx', description: 'Generated in Bluesky: Settings > Privacy and Security > App Passwords (do not use your regular account password)' },
       { name: 'Incoming Webhook Fallback URL', key: 'webhookUrl', type: 'text', placeholder: 'https://hooks.zapier.com/...', description: 'Optional Webhook: Fires real-time content payloads directly to this endpoint.' }
     ]
   },
@@ -227,6 +228,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   const [activeConfigPlatform, setActiveConfigPlatform] = useState<string | null>(null);
   const [tempCredentials, setTempCredentials] = useState<Record<string, string>>({});
   const [tempHandle, setTempHandle] = useState<string>('');
+  const [testConnectionStatus, setTestConnectionStatus] = useState<{ loading: boolean; success?: boolean; message?: string } | null>(null);
   
   // Custom states for manual poster helper
   const [helperTargets, setHelperTargets] = useState<string[]>([]);
@@ -360,7 +362,14 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   const [schedulerMode, setSchedulerMode] = useState<'realtime' | 'timemachine'>(() => {
     return (localStorage.getItem('campaign_scheduler_mode') as 'realtime' | 'timemachine') || 'timemachine';
   });
+  const [realTimeCadence, setRealTimeCadence] = useState<'slot_time' | '15s' | '30s' | '1m' | '5m'>(() => {
+    return (localStorage.getItem('campaign_realtime_cadence') as any) || 'slot_time';
+  });
   const [realTimeClock, setRealTimeClock] = useState<string>('');
+  const [realTimeCountdown, setRealTimeCountdown] = useState<string>('');
+  const [realTimeDue, setRealTimeDue] = useState<boolean>(false);
+  const isAutoPublishingRef = useRef<boolean>(false);
+  const lastAutoPublishTimeRef = useRef<number>(0);
   const [timeMachineWeek, setTimeMachineWeek] = useState<number>(() => {
     return Number(localStorage.getItem('campaign_time_machine_week')) || 1;
   });
@@ -390,6 +399,10 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   useEffect(() => {
     localStorage.setItem('campaign_scheduler_mode', schedulerMode);
   }, [schedulerMode]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_realtime_cadence', realTimeCadence);
+  }, [realTimeCadence]);
 
   useEffect(() => {
     localStorage.setItem('campaign_time_machine_week', String(timeMachineWeek));
@@ -475,6 +488,9 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
           if (serverData.isAutonomousActive || serverData.campaignData) {
             setIsAutonomousActive(serverData.isAutonomousActive);
             setSchedulerMode(serverData.schedulerMode);
+            if (serverData.realTimeCadence) {
+              setRealTimeCadence(serverData.realTimeCadence);
+            }
             setTimeMachineWeek(serverData.timeMachineWeek);
             setTimeMachineDay(serverData.timeMachineDay);
             setTimeMachineTime(serverData.timeMachineTime);
@@ -534,6 +550,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
           body: JSON.stringify({
             isAutonomousActive,
             schedulerMode,
+            realTimeCadence,
             timeMachineWeek,
             timeMachineDay,
             timeMachineTime,
@@ -550,7 +567,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
     const timeout = setTimeout(syncToServer, 500);
     return () => clearTimeout(timeout);
-  }, [isAutonomousActive, schedulerMode, timeMachineWeek, timeMachineDay, timeMachineTime, campaignData, auditLogs, autoConsoleLogs, publishedPostIds]);
+  }, [isAutonomousActive, schedulerMode, realTimeCadence, timeMachineWeek, timeMachineDay, timeMachineTime, campaignData, auditLogs, autoConsoleLogs, publishedPostIds]);
 
   // Find all pending posts across all weeks and days strictly aware of posting history
   const pendingPosts = useMemo(() => {
@@ -577,18 +594,22 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
   // Autonomous posting execution handler
   const triggerAutoPublish = async (target: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }) => {
-    const { post, weekNum, dayNum, isFloat } = target;
+    if (isAutoPublishingRef.current) return;
+    isAutoPublishingRef.current = true;
 
-    const timestampStr = new Date().toLocaleTimeString();
+    try {
+      const { post, weekNum, dayNum, isFloat } = target;
 
-    // 1. Strict Idempotency Guard: NEVER publish any post that has already been published
-    if (isPostAlreadyPublished(post)) {
-      setAutoConsoleLogs(prev => [
-        `⚠️ [${timestampStr}] Duplicate avoided: Post "${post.id}" (Week ${weekNum} Day ${dayNum}) is already recorded in posting history. Advancing to next scheduled post.`,
-        ...prev
-      ]);
-      return;
-    }
+      const timestampStr = new Date().toLocaleTimeString();
+
+      // 1. Strict Idempotency Guard: NEVER publish any post that has already been published
+      if (isPostAlreadyPublished(post)) {
+        setAutoConsoleLogs(prev => [
+          `⚠️ [${timestampStr}] Duplicate avoided: Post "${post.id}" (Week ${weekNum} Day ${dayNum}) is already recorded in posting history. Advancing to next scheduled post.`,
+          ...prev
+        ]);
+        return;
+      }
 
     // Identify active linked platforms
     const activeTargets = Object.keys(connections || {}).filter(id => {
@@ -630,7 +651,16 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
           publishDetails += `${platform.name}: SIM_SUCCESS; `;
         }
       } else {
-        setAutoConsoleLogs(prev => [`[${timestampStr}] ❌ [${platform.name}] REAL PUBLISH FAILED: ${res.error || 'Unknown API rejection'}`, ...prev]);
+        const isAuthErr = res.isAuthError || (res.error && res.error.toLowerCase().includes('invalid identifier or password'));
+        if (isAuthErr) {
+          setAutoConsoleLogs(prev => [
+            `[${timestampStr}] ⚠️ [${platform.name}] AUTHENTICATION REJECTED: ${res.error}`,
+            `[${timestampStr}] 💡 [${platform.name}] Tip: Click [${platform.name}] > "Manual API Key" to enter an App Password created in Bluesky Settings > App Passwords, or switch to Zero-Cost Mode for 1-click web composer.`,
+            ...prev
+          ]);
+        } else {
+          setAutoConsoleLogs(prev => [`[${timestampStr}] ❌ [${platform.name}] REAL PUBLISH FAILED: ${res.error || 'Unknown API rejection'}`, ...prev]);
+        }
         publishDetails += `${platform.name}: FAILED (${res.error}); `;
       }
     }
@@ -728,6 +758,20 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       `[${timestampStr}] 🏁 Autonomous Scheduler published Week ${weekNum} Day ${dayNum} - ${post.role}!`,
       ...prev
     ]);
+    } finally {
+      isAutoPublishingRef.current = false;
+      lastAutoPublishTimeRef.current = Date.now();
+    }
+  };
+
+  // Immediate dispatch on-demand for the current queued target
+  const handleForceDispatchCurrentTarget = async () => {
+    if (!nextTarget || isAutoPublishingRef.current) return;
+    setAutoConsoleLogs(prev => [
+      `[${new Date().toLocaleTimeString()}] ⚡ Fast-Track Action: Instantly triggering dispatch for Week ${nextTarget.weekNum} Day ${nextTarget.dayNum} (${nextTarget.post.time || '12:00'})...`,
+      ...prev
+    ]);
+    await triggerAutoPublish(nextTarget);
   };
 
   // Sync Time Machine clock to the upcoming post's day start when activated manually
@@ -780,24 +824,75 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     }
 
     if (schedulerMode === 'realtime') {
-      // --- REALTIME MODE: FOLLOW REAL WALL-CLOCK SCHEDULE ---
+      // --- REALTIME MODE: ACCURATE WALL-CLOCK & LIVE CADENCE SCHEDULER ---
+      const intervalMs = realTimeCadence === '15s' ? 15000 : realTimeCadence === '30s' ? 30000 : realTimeCadence === '1m' ? 60000 : realTimeCadence === '5m' ? 300000 : 0;
+      let intervalAnchorMs = Date.now();
+
       const timer = setInterval(() => {
         const now = new Date();
-        const curHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-        const curSec = now.getSeconds();
-        
-        setRealTimeClock(now.toLocaleTimeString());
+        const curClock = now.toLocaleTimeString();
+        setRealTimeClock(curClock);
 
-        // Target scheduled time
-        const targetTimeStr = nextTarget.post.time || '12:00';
-        
-        // Progress within the current minute (nice visual countdown bar)
-        setSimProgress((curSec / 60) * 100);
+        if (isAutoPublishingRef.current) return;
 
-        if (curHHMM === targetTimeStr) {
-          triggerAutoPublish(nextTarget);
+        if (realTimeCadence === 'slot_time') {
+          // Scheduled Wall-Clock Mode: Posts match slot time (e.g., 07:30, 10:00, 12:00)
+          const targetTimeStr = nextTarget.post.time || '12:00';
+          const [tH, tM] = targetTimeStr.split(':').map(Number);
+          const targetHour = isNaN(tH) ? 12 : tH;
+          const targetMin = isNaN(tM) ? 0 : tM;
+          const targetTotalMins = targetHour * 60 + targetMin;
+
+          const curMins = now.getHours() * 60 + now.getMinutes();
+          const curSec = now.getSeconds();
+          const curTotalSecs = curMins * 60 + curSec;
+          const targetTotalSecs = targetTotalMins * 60;
+
+          if (curMins >= targetTotalMins) {
+            // Target scheduled slot is DUE or past due!
+            setRealTimeDue(true);
+            setRealTimeCountdown('Due for dispatch');
+            setSimProgress(100);
+
+            // Throttle consecutive dispatches so they fire sequentially with clean cadence (4s cooldown)
+            const timeSinceLastPublish = Date.now() - lastAutoPublishTimeRef.current;
+            if (timeSinceLastPublish >= 4000) {
+              triggerAutoPublish(nextTarget);
+            }
+          } else {
+            // Target is scheduled for later today
+            setRealTimeDue(false);
+            const diffSecs = targetTotalSecs - curTotalSecs;
+            const diffH = Math.floor(diffSecs / 3600);
+            const diffM = Math.floor((diffSecs % 3600) / 60);
+            const diffS = diffSecs % 60;
+            const formatted = `${String(diffH).padStart(2, '0')}:${String(diffM).padStart(2, '0')}:${String(diffS).padStart(2, '0')}`;
+            setRealTimeCountdown(formatted);
+
+            // Calculate progress bar toward scheduled time
+            const progress = Math.min(100, Math.max(5, (1 - (diffSecs / (120 * 60))) * 100));
+            setSimProgress(progress);
+          }
+        } else {
+          // Live testing interval cadence (15s, 30s, 1m, 5m)
+          const nowMs = Date.now();
+          const elapsed = nowMs - intervalAnchorMs;
+          const remainingSecs = Math.max(0, Math.ceil((intervalMs - elapsed) / 1000));
+
+          setRealTimeDue(remainingSecs === 0);
+          setRealTimeCountdown(`${remainingSecs}s`);
+          const pct = Math.min(100, Math.max(0, (elapsed / intervalMs) * 100));
+          setSimProgress(pct);
+
+          if (elapsed >= intervalMs) {
+            intervalAnchorMs = Date.now();
+            const timeSinceLastPublish = Date.now() - lastAutoPublishTimeRef.current;
+            if (timeSinceLastPublish >= 2000) {
+              triggerAutoPublish(nextTarget);
+            }
+          }
         }
-      }, 1000);
+      }, 500);
 
       return () => clearInterval(timer);
     } else {
@@ -874,7 +969,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
       return () => clearInterval(timer);
     }
-  }, [isAutonomousActive, nextTargetId, schedulerMode, timeMachineWeek, timeMachineDay, timeMachineTime]);
+  }, [isAutonomousActive, nextTargetId, schedulerMode, realTimeCadence, timeMachineWeek, timeMachineDay, timeMachineTime]);
 
   // Sync draft area text with active post if changed
   useEffect(() => {
@@ -1120,6 +1215,30 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     setActiveConfigPlatform(platformId);
     setTempCredentials(current.credentials || {});
     setTempHandle(current.handle || PLATFORMS.find(p => p.id === platformId)?.placeholder || '');
+    setTestConnectionStatus(null);
+  };
+
+  const handleTestConnection = async () => {
+    if (!activeConfigPlatform) return;
+    setTestConnectionStatus({ loading: true });
+    try {
+      const res = await fetch('/api/verify-credentials', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          platformId: activeConfigPlatform,
+          credentials: tempCredentials
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.valid) {
+        setTestConnectionStatus({ loading: false, success: true, message: data.message || 'Credentials verified successfully!' });
+      } else {
+        setTestConnectionStatus({ loading: false, success: false, message: data.error || 'Verification failed. Please check credentials.' });
+      }
+    } catch (e: any) {
+      setTestConnectionStatus({ loading: false, success: false, message: e.message || 'Network request failed.' });
+    }
   };
 
   const saveConfigModal = () => {
@@ -1144,7 +1263,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     setActiveConfigPlatform(null);
   };
 
-  const dispatchPostToPlatform = async (platformId: string, text: string): Promise<{ status: 'SUCCESS' | 'FAILED'; error?: string; real: boolean }> => {
+  const dispatchPostToPlatform = async (platformId: string, text: string): Promise<{ status: 'SUCCESS' | 'FAILED'; error?: string; real: boolean; isAuthError?: boolean }> => {
     const platform = PLATFORMS.find(p => p.id === platformId);
     if (!platform) {
       return { status: 'FAILED', error: 'Platform not found', real: false };
@@ -1173,7 +1292,8 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
         return { 
           status: 'FAILED', 
           error: errData.error || `HTTP error ${response.status}`, 
-          real: errData.real ?? true 
+          real: errData.real ?? true,
+          isAuthError: errData.isAuthError || response.status === 401
         };
       }
 
@@ -1181,7 +1301,8 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       return { 
         status: resData.status, 
         error: resData.error, 
-        real: resData.real 
+        real: resData.real,
+        isAuthError: resData.isAuthError
       };
     } catch (e: any) {
       return { 
@@ -1285,8 +1406,10 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       } else {
         setConsoleLogs(prev => [
           ...prev,
-          `[${new Date().toLocaleTimeString()}] ❌ REAL ${platform.name.toUpperCase()} FAILED: ${res.error || 'Unknown error'}`
+          `[${new Date().toLocaleTimeString()}] ❌ REAL ${platform.name.toUpperCase()} FAILED: ${res.error || 'Unknown error'}`,
+          `[${new Date().toLocaleTimeString()}] 💡 Opening ${platform.name} One-Click Manual Helper so your draft is ready to post!`
         ]);
+        manualTargets.push(tid);
       }
     }
 
@@ -1636,10 +1759,72 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
                   ⏰ Real-Time Clock
                 </button>
               </div>
+
+              {/* Real-Time Cadence Selection */}
+              {schedulerMode === 'realtime' && (
+                <div className="pt-1 space-y-1">
+                  <div className="flex items-center justify-between text-[10px] font-mono text-neutral-500 font-bold">
+                    <span>REAL-TIME CADENCE</span>
+                    <span className="text-[9px] text-neutral-400 font-normal">
+                      {realTimeCadence === 'slot_time' ? 'Wall-Clock Slots' : 'Live Interval'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1 p-1 bg-neutral-100 rounded-lg border border-neutral-200 text-[10px]">
+                    <button
+                      type="button"
+                      onClick={() => setRealTimeCadence('slot_time')}
+                      className={`py-1 px-1 font-bold rounded transition-all truncate text-center ${
+                        realTimeCadence === 'slot_time'
+                          ? 'bg-white text-neutral-950 shadow-sm'
+                          : 'text-neutral-500 hover:text-neutral-800'
+                      }`}
+                      title="Follow scheduled slot times (07:30, 10:00, etc.) with automatic due dispatch"
+                    >
+                      Slot Time
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRealTimeCadence('30s')}
+                      className={`py-1 px-1 font-bold rounded transition-all truncate text-center ${
+                        realTimeCadence === '30s'
+                          ? 'bg-white text-neutral-950 shadow-sm'
+                          : 'text-neutral-500 hover:text-neutral-800'
+                      }`}
+                      title="Dispatches 1 scheduled post every 30 seconds"
+                    >
+                      30s Demo
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRealTimeCadence('1m')}
+                      className={`py-1 px-1 font-bold rounded transition-all truncate text-center ${
+                        realTimeCadence === '1m'
+                          ? 'bg-white text-neutral-950 shadow-sm'
+                          : 'text-neutral-500 hover:text-neutral-800'
+                      }`}
+                      title="Dispatches 1 scheduled post every 1 minute"
+                    >
+                      1m
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRealTimeCadence('5m')}
+                      className={`py-1 px-1 font-bold rounded transition-all truncate text-center ${
+                        realTimeCadence === '5m'
+                          ? 'bg-white text-neutral-950 shadow-sm'
+                          : 'text-neutral-500 hover:text-neutral-800'
+                      }`}
+                      title="Dispatches 1 scheduled post every 5 minutes"
+                    >
+                      5m
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Dynamic Clock and Time Display */}
-            <div className="p-3 bg-neutral-100 rounded-lg border border-neutral-200 text-xs space-y-1.5">
+            <div className="p-3 bg-neutral-100 rounded-lg border border-neutral-200 text-xs space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] text-neutral-400 uppercase font-black font-mono">Current Engine Clock:</span>
                 {isAutonomousActive && (
@@ -1648,13 +1833,40 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
               </div>
               
               {schedulerMode === 'realtime' ? (
-                <div className="space-y-1">
-                  <div className="font-mono font-extrabold text-neutral-900 text-sm flex items-center gap-1.5">
-                    <span>🕒 {realTimeClock || new Date().toLocaleTimeString()}</span>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono font-extrabold text-neutral-900 text-sm flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-neutral-600" />
+                      <span>{realTimeClock || new Date().toLocaleTimeString()}</span>
+                    </span>
+                    {realTimeDue ? (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-amber-200 text-amber-900 border border-amber-300 animate-pulse">
+                        ⚡ DUE NOW
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-mono text-neutral-600 font-bold">
+                        ⏳ in {realTimeCountdown || '--:--'}
+                      </span>
+                    )}
                   </div>
                   <p className="text-[10px] text-neutral-500 leading-snug">
-                    Running continuously on server. Monitoring system clock for scheduled slots.
+                    {realTimeCadence === 'slot_time'
+                      ? 'Monitors wall-clock against post schedule times. Automatically dispatches due posts.'
+                      : `Live real-time cadence (${realTimeCadence}). Sequential execution linked to posting history.`}
                   </p>
+
+                  {/* Fast-Track manual dispatch button */}
+                  {nextTarget && (
+                    <button
+                      type="button"
+                      onClick={handleForceDispatchCurrentTarget}
+                      disabled={isAutoPublishingRef.current}
+                      className="w-full mt-1 py-1 px-2 text-[10px] font-bold rounded bg-neutral-900 text-white hover:bg-neutral-800 transition flex items-center justify-center gap-1 shadow-sm disabled:opacity-50"
+                    >
+                      <Zap className="w-3 h-3 text-amber-400" />
+                      <span>Dispatch Current Slot Now</span>
+                    </button>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-1">
@@ -1672,7 +1884,11 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             {isAutonomousActive && nextTarget && (
               <div className="space-y-1 pt-1">
                 <div className="flex justify-between text-[11px]">
-                  <span className="text-neutral-500 font-medium">Staging: Week {nextTarget.weekNum} Day {nextTarget.dayNum}</span>
+                  <span className="text-neutral-500 font-medium truncate">
+                    {schedulerMode === 'realtime' && realTimeDue
+                      ? '⚡ Executing due dispatch...'
+                      : `Staging: Week ${nextTarget.weekNum} Day ${nextTarget.dayNum} (${nextTarget.post.time || '12:00'})`}
+                  </span>
                   <span className="font-mono font-bold text-neutral-900">{Math.round(simProgress)}%</span>
                 </div>
                 <div className="w-full bg-neutral-200 rounded-full h-1.5 overflow-hidden">
@@ -1707,7 +1923,15 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
               <div className="p-2.5 rounded-lg bg-white border border-neutral-200/80 text-xs space-y-1">
                 <div className="flex items-center justify-between">
                   <span className="text-[9px] text-neutral-400 font-bold font-mono uppercase">NEXT UNPUBLISHED RESUME TARGET</span>
-                  <span className="text-[10px] font-mono text-neutral-400">{nextTarget.post.time || '12:00'}</span>
+                  {schedulerMode === 'realtime' && realTimeDue ? (
+                    <span className="text-[9px] font-mono font-bold bg-amber-100 text-amber-800 border border-amber-300 px-1 py-0.5 rounded animate-pulse">
+                      ⚡ DUE NOW ({nextTarget.post.time || '12:00'})
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-mono text-neutral-500 font-medium">
+                      {nextTarget.post.time || '12:00'}
+                    </span>
+                  )}
                 </div>
                 <div className="flex justify-between font-bold text-neutral-900">
                   <span>Week {nextTarget.weekNum} Day {nextTarget.dayNum}</span>
@@ -2021,6 +2245,46 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
                         <p className="text-[9px] text-neutral-400 leading-relaxed">{field.description}</p>
                       </div>
                     ))}
+                  </div>
+
+                  {/* Test Connection Button & Live Validation Result */}
+                  <div className="pt-1">
+                    <button 
+                      type="button"
+                      onClick={handleTestConnection}
+                      disabled={testConnectionStatus?.loading}
+                      className="w-full py-2.5 px-3 border border-neutral-200 bg-neutral-100 hover:bg-neutral-200 text-neutral-800 text-xs font-bold rounded-lg flex items-center justify-center gap-2 transition disabled:opacity-50"
+                    >
+                      {testConnectionStatus?.loading ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-neutral-600" />
+                          <span>Verifying with {platform.name}...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Zap className="w-3.5 h-3.5 text-amber-600" />
+                          <span>Test & Verify Credentials</span>
+                        </>
+                      )}
+                    </button>
+
+                    {testConnectionStatus && !testConnectionStatus.loading && (
+                      <div className={`mt-2.5 p-3 rounded-lg border text-xs flex items-start gap-2.5 ${
+                        testConnectionStatus.success 
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-900' 
+                          : 'bg-rose-50 border-rose-200 text-rose-900'
+                      }`}>
+                        {testConnectionStatus.success ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
+                        ) : (
+                          <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0 mt-0.5" />
+                        )}
+                        <div className="flex-1 text-[11px] leading-relaxed">
+                          <span className="font-bold block mb-0.5">{testConnectionStatus.success ? 'Verification Succeeded' : 'Authentication Failed'}</span>
+                          <span>{testConnectionStatus.message}</span>
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   <div className="bg-neutral-50 p-3 rounded-lg border border-neutral-200/50 text-[10px] text-neutral-600 leading-relaxed flex items-start gap-2">
