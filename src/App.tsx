@@ -63,6 +63,72 @@ export default function App() {
     localStorage.setItem('campaign_planner_data', JSON.stringify(campaign));
   }, [campaign]);
 
+  // Reconcile campaign published flags with persistent posting history
+  useEffect(() => {
+    const savedLogs = localStorage.getItem('campaign_publish_logs');
+    const savedIds = localStorage.getItem('campaign_published_ids');
+    const publishedIds = new Set<string>();
+    const publishedTexts = new Set<string>();
+
+    if (savedIds) {
+      try {
+        const arr = JSON.parse(savedIds);
+        if (Array.isArray(arr)) arr.forEach((id: string) => publishedIds.add(id));
+      } catch (e) {}
+    }
+
+    if (savedLogs) {
+      try {
+        const logs = JSON.parse(savedLogs);
+        if (Array.isArray(logs)) {
+          logs.forEach((l: any) => {
+            if (l.status === 'SUCCESS') {
+              if (l.postId) publishedIds.add(l.postId);
+              if (l.postText) publishedTexts.add(l.postText.trim());
+            }
+          });
+        }
+      } catch (e) {}
+    }
+
+    if (publishedIds.size > 0 || publishedTexts.size > 0) {
+      setCampaign(prev => {
+        let changed = false;
+        const updatedWeeks = prev.weeks.map(w => ({
+          ...w,
+          days: w.days.map(d => ({
+            ...d,
+            posts: d.posts.map(p => {
+              const isDone = p.isPublished || publishedIds.has(p.id) || (p.text && publishedTexts.has(p.text.trim()));
+              if (isDone !== p.isPublished) {
+                changed = true;
+                return { ...p, isPublished: isDone, publishedAt: p.publishedAt || new Date().toISOString() };
+              }
+              return p;
+            }),
+            floats: d.floats.map(f => {
+              const isDone = f.isPublished || publishedIds.has(f.id) || (f.text && publishedTexts.has(f.text.trim()));
+              if (isDone !== f.isPublished) {
+                changed = true;
+                return { ...f, isPublished: isDone, publishedAt: f.publishedAt || new Date().toISOString() };
+              }
+              return f;
+            })
+          }))
+        }));
+
+        return changed ? { ...prev, weeks: updatedWeeks } : prev;
+      });
+    }
+  }, []);
+
+  const handleResetCampaignHistory = () => {
+    localStorage.removeItem('campaign_publish_logs');
+    localStorage.removeItem('campaign_published_ids');
+    setCampaign(initialCampaignData);
+    localStorage.setItem('campaign_planner_data', JSON.stringify(initialCampaignData));
+  };
+
   useEffect(() => {
     localStorage.setItem('campaign_ledger_entries', JSON.stringify(ledger));
   }, [ledger]);
@@ -291,6 +357,7 @@ export default function App() {
             <IntegrationsHub 
               campaignData={campaign} 
               onUpdateCampaignData={(updated) => setCampaign(updated)}
+              onResetCampaignHistory={handleResetCampaignHistory}
               onAddLedgerEntry={(entry) => {
                 const newId = 'l_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
                 setLedger(prev => [

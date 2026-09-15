@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Share2, Check, RefreshCw, Key, Link2, LogOut, Terminal, ShieldCheck,
@@ -33,6 +33,11 @@ interface ConnectionState {
 
 interface PublishLog {
   id: string;
+  postId?: string;
+  weekNum?: number;
+  dayNum?: number;
+  slot?: number | string;
+  role?: string;
   timestamp: string;
   postText: string;
   postRef: string;
@@ -46,6 +51,7 @@ interface IntegrationsHubProps {
   campaignData: CampaignData;
   activePost?: Post | FloatPost;
   onUpdateCampaignData?: (updated: CampaignData) => void;
+  onResetCampaignHistory?: () => void;
   onAddLedgerEntry?: (entry: Partial<LedgerEntry>) => void;
 }
 
@@ -174,6 +180,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   campaignData, 
   activePost,
   onUpdateCampaignData,
+  onResetCampaignHistory,
   onAddLedgerEntry
 }) => {
   // Load connection states from localStorage
@@ -224,6 +231,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   // Custom states for manual poster helper
   const [helperTargets, setHelperTargets] = useState<string[]>([]);
   const [showCopySuccessToast, setShowCopySuccessToast] = useState<boolean>(false);
+  const [showResetConfirm, setShowResetConfirm] = useState<boolean>(false);
   
   // Custom draft publish mechanics
   const [selectedWeek, setSelectedWeek] = useState<number>(1);
@@ -257,6 +265,11 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     return [
       {
         id: 'log-1',
+        postId: 'w1_d1_p1',
+        weekNum: 1,
+        dayNum: 1,
+        slot: 1,
+        role: 'Anchor',
         timestamp: '2026-09-12 18:30:15',
         postText: 'Welcome to Day 1 of our Monthly Campaign! Anchor post ready to drop.',
         postRef: 'Week 1 Day 1 (Slot 1)',
@@ -271,6 +284,74 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   useEffect(() => {
     localStorage.setItem('campaign_publish_logs', JSON.stringify(auditLogs));
   }, [auditLogs]);
+
+  // Maintain persistent Set of published post IDs and text signatures directly linked to posting history
+  const { publishedPostIds, publishedPostTexts } = useMemo(() => {
+    const ids = new Set<string>();
+    const texts = new Set<string>();
+
+    const savedIds = localStorage.getItem('campaign_published_ids');
+    if (savedIds) {
+      try {
+        const parsed = JSON.parse(savedIds);
+        if (Array.isArray(parsed)) parsed.forEach(id => ids.add(id));
+      } catch (e) {}
+    }
+
+    auditLogs.forEach(log => {
+      if (log.status === 'SUCCESS') {
+        if (log.postId) ids.add(log.postId);
+        if (log.postText) texts.add(log.postText.trim());
+      }
+    });
+
+    return { publishedPostIds: ids, publishedPostTexts: texts };
+  }, [auditLogs]);
+
+  // Persist publishedPostIds to localStorage
+  useEffect(() => {
+    localStorage.setItem('campaign_published_ids', JSON.stringify(Array.from(publishedPostIds)));
+  }, [publishedPostIds]);
+
+  // Authoritative check against posting history to eliminate duplicates
+  const isPostAlreadyPublished = useCallback((post: Post | FloatPost) => {
+    if (post.isPublished) return true;
+    if (publishedPostIds.has(post.id)) return true;
+    if (post.text && publishedPostTexts.has(post.text.trim())) return true;
+    return false;
+  }, [publishedPostIds, publishedPostTexts]);
+
+  // Reconcile campaignData with posting history
+  useEffect(() => {
+    if (!onUpdateCampaignData || publishedPostIds.size === 0) return;
+    let needsUpdate = false;
+    const updatedWeeks = campaignData.weeks.map(w => ({
+      ...w,
+      days: w.days.map(d => ({
+        ...d,
+        posts: d.posts.map(p => {
+          const isDone = p.isPublished || publishedPostIds.has(p.id) || (p.text && publishedPostTexts.has(p.text.trim()));
+          if (isDone !== p.isPublished) {
+            needsUpdate = true;
+            return { ...p, isPublished: isDone, publishedAt: p.publishedAt || new Date().toISOString() };
+          }
+          return p;
+        }),
+        floats: d.floats.map(f => {
+          const isDone = f.isPublished || publishedPostIds.has(f.id) || (f.text && publishedPostTexts.has(f.text.trim()));
+          if (isDone !== f.isPublished) {
+            needsUpdate = true;
+            return { ...f, isPublished: isDone, publishedAt: f.publishedAt || new Date().toISOString() };
+          }
+          return f;
+        })
+      }))
+    }));
+
+    if (needsUpdate) {
+      onUpdateCampaignData({ ...campaignData, weeks: updatedWeeks });
+    }
+  }, [publishedPostIds, publishedPostTexts]);
 
   // Autonomous Scheduler state with local storage persistence
   const [isAutonomousActive, setIsAutonomousActive] = useState<boolean>(() => {
@@ -398,11 +479,27 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             setTimeMachineDay(serverData.timeMachineDay);
             setTimeMachineTime(serverData.timeMachineTime);
             
+            if (serverData.auditLogs && serverData.auditLogs.length > 0) {
+              setAuditLogs(prev => {
+                const combined = [...serverData.auditLogs, ...prev];
+                const seen = new Set<string>();
+                return combined.filter(item => {
+                  if (seen.has(item.id)) return false;
+                  seen.add(item.id);
+                  return true;
+                });
+              });
+            }
+
+            if (serverData.publishedPostIds && serverData.publishedPostIds.length > 0) {
+              const currentSaved = localStorage.getItem('campaign_published_ids');
+              const setIds = new Set<string>(currentSaved ? JSON.parse(currentSaved) : []);
+              serverData.publishedPostIds.forEach((id: string) => setIds.add(id));
+              localStorage.setItem('campaign_published_ids', JSON.stringify(Array.from(setIds)));
+            }
+
             if (serverData.campaignData && onUpdateCampaignData) {
               onUpdateCampaignData(serverData.campaignData);
-            }
-            if (serverData.auditLogs && serverData.auditLogs.length > 0) {
-              setAuditLogs(serverData.auditLogs);
             }
             if (serverData.autoConsoleLogs && serverData.autoConsoleLogs.length > 0) {
               setAutoConsoleLogs(serverData.autoConsoleLogs);
@@ -442,7 +539,8 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             timeMachineTime,
             campaignData,
             auditLogs,
-            autoConsoleLogs
+            autoConsoleLogs,
+            publishedPostIds: Array.from(publishedPostIds)
           })
         });
       } catch (err) {
@@ -452,27 +550,27 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
     const timeout = setTimeout(syncToServer, 500);
     return () => clearTimeout(timeout);
-  }, [isAutonomousActive, schedulerMode, timeMachineWeek, timeMachineDay, timeMachineTime, campaignData, auditLogs, autoConsoleLogs]);
+  }, [isAutonomousActive, schedulerMode, timeMachineWeek, timeMachineDay, timeMachineTime, campaignData, auditLogs, autoConsoleLogs, publishedPostIds]);
 
-  // Find all pending posts across all weeks and days (Memoized to prevent reference-equality interval restarts)
+  // Find all pending posts across all weeks and days strictly aware of posting history
   const pendingPosts = useMemo(() => {
     const list: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }[] = [];
     campaignData.weeks.forEach(wk => {
       wk.days.forEach(dy => {
         dy.posts.forEach(p => {
-          if (!p.isPublished) {
+          if (!isPostAlreadyPublished(p)) {
             list.push({ post: p, weekNum: wk.week, dayNum: dy.day, isFloat: false });
           }
         });
         dy.floats.forEach(f => {
-          if (!f.isPublished) {
+          if (!isPostAlreadyPublished(f)) {
             list.push({ post: f, weekNum: wk.week, dayNum: dy.day, isFloat: true });
           }
         });
       });
     });
     return list;
-  }, [campaignData]);
+  }, [campaignData, isPostAlreadyPublished]);
 
   const nextTarget = pendingPosts[0] || null;
   const nextTargetId = nextTarget?.post.id || '';
@@ -480,6 +578,17 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   // Autonomous posting execution handler
   const triggerAutoPublish = async (target: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }) => {
     const { post, weekNum, dayNum, isFloat } = target;
+
+    const timestampStr = new Date().toLocaleTimeString();
+
+    // 1. Strict Idempotency Guard: NEVER publish any post that has already been published
+    if (isPostAlreadyPublished(post)) {
+      setAutoConsoleLogs(prev => [
+        `⚠️ [${timestampStr}] Duplicate avoided: Post "${post.id}" (Week ${weekNum} Day ${dayNum}) is already recorded in posting history. Advancing to next scheduled post.`,
+        ...prev
+      ]);
+      return;
+    }
 
     // Identify active linked platforms
     const activeTargets = Object.keys(connections || {}).filter(id => {
@@ -490,8 +599,6 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     const targetPlatforms = activeTargets.length > 0 
       ? activeTargets.map(id => PLATFORMS.find(p => p.id === id)?.name || id)
       : ['Simulated Global Feed'];
-
-    const timestampStr = new Date().toLocaleTimeString();
 
     // Verification & compliance audit logging
     const logHeading = `🕒 [${timestampStr}] Schedule Reached: Week ${weekNum} Day ${dayNum} - ${post.role} (${post.type})`;
@@ -531,7 +638,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     setAutoConsoleLogs(prev => [
       `🚀 [${timestampStr}] Autonomous sequence finished! Verified transaction details on ledger.`,
       `📢 [${timestampStr}] Successfully published to targets: [${targetPlatforms.join(', ')}]`,
-      `✅ [${timestampStr}] compliance Guardrail Audit: PASSED`,
+      `✅ [${timestampStr}] Compliance Guardrail Audit: PASSED`,
       ...prev
     ]);
 
@@ -599,9 +706,14 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       ]);
     }
 
-    // Add to Audit logs for publish history
+    // Add to Audit logs for publish history with explicit IDs and metadata
     const newLog: PublishLog = {
       id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+      postId: post.id,
+      weekNum: weekNum,
+      dayNum: dayNum,
+      slot: 'slot' in post ? post.slot : 'float',
+      role: post.role,
       timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
       postText: post.text,
       postRef: `Week ${weekNum} Day ${dayNum} (${post.role} - ${post.type})`,
@@ -625,11 +737,31 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       if (schedulerMode === 'timemachine') {
         setTimeMachineWeek(nextTarget.weekNum);
         setTimeMachineDay(nextTarget.dayNum);
-        setTimeMachineTime('00:00');
+        
+        // Target post scheduled time
+        const targetTimeStr = nextTarget.post.time || '12:00';
+        const [tH, tM] = targetTimeStr.split(':').map(Number);
+        const targetTotalMins = (isNaN(tH) ? 12 : tH) * 60 + (isNaN(tM) ? 0 : tM);
+        
+        // Start simulated time shortly before target post (30 mins before)
+        const startMins = Math.max(0, targetTotalMins - 30);
+        const startH = Math.floor(startMins / 60);
+        const startM = startMins % 60;
+        const startTimeStr = `${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}`;
+        
+        setTimeMachineTime(startTimeStr);
         setSimProgress(0);
       }
+      
+      const totalPostsCount = 228;
+      const publishedCount = totalPostsCount - pendingPosts.length;
+      setAutoConsoleLogs(prev => [
+        `[${new Date().toLocaleTimeString()}] 🚀 Autonomous Auto-Publisher started. Resuming sequentially at Week ${nextTarget.weekNum} Day ${nextTarget.dayNum} - ${nextTarget.post.role} (${nextTarget.post.time || '12:00'}).`,
+        `[${new Date().toLocaleTimeString()}] 📜 Posting History linked: ${publishedCount} / ${totalPostsCount} posts published. Strictly sequential and duplicate-free.`,
+        ...prev
+      ]);
     }
-  }, [isAutonomousActive, schedulerMode, nextTarget]);
+  }, [isAutonomousActive, schedulerMode, nextTargetId]);
 
   useEffect(() => {
     if (!isAutonomousActive) {
@@ -722,10 +854,18 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             }, 100);
           }
         } else if (currentWeek < nextTarget.weekNum || (currentWeek === nextTarget.weekNum && currentDay < nextTarget.dayNum)) {
-          // Still traveling to the target day
-          setSimProgress((currentMins / 1440) * 100);
+          // Auto-warp to upcoming pending target day so we never linger in already-published days
+          currentWeek = nextTarget.weekNum;
+          currentDay = nextTarget.dayNum;
+          currentMins = Math.max(0, targetMins - 30);
+          const warpHour = Math.floor(currentMins / 60);
+          const warpMin = currentMins % 60;
+          setTimeMachineWeek(currentWeek);
+          setTimeMachineDay(currentDay);
+          setTimeMachineTime(`${String(warpHour).padStart(2, '0')}:${String(warpMin).padStart(2, '0')}`);
+          setSimProgress(Math.min(100, Math.max(0, (currentMins / targetMins) * 100)));
         } else {
-          // Time-machine is ahead of target day, immediately dispatch to catch up
+          // Time-machine is ahead of target day/time, immediately dispatch to catch up
           clearInterval(timer);
           triggerAutoPublish(nextTarget);
         }
@@ -1186,6 +1326,9 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
     const newLog: PublishLog = {
       id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+      postId: selectedPostId || undefined,
+      weekNum: selectedWeek,
+      dayNum: selectedDay,
       timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
       postText: customDraftText,
       postRef: `Week ${selectedWeek} Day ${selectedDay} (${selectedPostId ? `ID: ${selectedPostId}` : 'Manual Draft'})`,
@@ -1194,6 +1337,27 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       details: details || 'Processed posting schedule correctly.',
       isReal: isRealUsed
     };
+
+    if (selectedPostId && onUpdateCampaignData && (finalStatus === 'SUCCESS' || finalStatus === 'PARTIAL')) {
+      const updatedCampaign = {
+        ...campaignData,
+        weeks: campaignData.weeks.map(w => {
+          if (w.week !== selectedWeek) return w;
+          return {
+            ...w,
+            days: w.days.map(d => {
+              if (d.day !== selectedDay) return d;
+              return {
+                ...d,
+                posts: d.posts.map(p => p.id === selectedPostId ? { ...p, isPublished: true, publishedAt: new Date().toISOString() } : p),
+                floats: d.floats.map(f => f.id === selectedPostId ? { ...f, isPublished: true, publishedAt: new Date().toISOString() } : f)
+              };
+            })
+          };
+        })
+      };
+      onUpdateCampaignData(updatedCampaign);
+    }
 
     setAuditLogs(prev => [newLog, ...prev]);
     setIsPublishing(false);
@@ -1263,7 +1427,26 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
   const clearLogs = () => {
     setAuditLogs([]);
-    setConsoleLogs([`[${new Date().toLocaleTimeString()}] Logs cleared by user.`]);
+    setConsoleLogs([`[${new Date().toLocaleTimeString()}] Visual logs cleared by user.`]);
+  };
+
+  const handleResetCampaignAndHistory = () => {
+    if (onResetCampaignHistory) {
+      onResetCampaignHistory();
+    } else {
+      localStorage.removeItem('campaign_publish_logs');
+      localStorage.removeItem('campaign_published_ids');
+      localStorage.removeItem('campaign_planner_data');
+    }
+    setAuditLogs([]);
+    setTimeMachineWeek(1);
+    setTimeMachineDay(1);
+    setTimeMachineTime('00:00');
+    localStorage.setItem('campaign_time_machine_week', '1');
+    localStorage.setItem('campaign_time_machine_day', '1');
+    localStorage.setItem('campaign_time_machine_time', '00:00');
+    setAutoConsoleLogs([`[${new Date().toLocaleTimeString()}] Posting history wiped. Autonomous scheduler reset to Day 1.`]);
+    setShowResetConfirm(false);
   };
 
   const connectionList = Object.values(connections || {}) as ConnectionState[];
@@ -1378,7 +1561,15 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={() => setShowResetConfirm(true)}
+              className="px-3 py-2 text-xs font-semibold rounded-lg border border-neutral-200 hover:bg-neutral-100 text-neutral-600 transition flex items-center gap-1.5"
+              title="Reset campaign posting history and start over from Day 1"
+            >
+              <RefreshCw className="w-3.5 h-3.5 text-neutral-500" />
+              <span>Reset to Day 1</span>
+            </button>
             <button
               onClick={() => setIsAutonomousActive(!isAutonomousActive)}
               className={`px-4 py-2 text-xs font-bold rounded-lg transition shadow-sm flex items-center gap-2 whitespace-nowrap ${
@@ -1411,7 +1602,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
               <div className="flex items-center gap-2">
                 <span className={`w-3 h-3 rounded-full ${isAutonomousActive ? 'bg-green-600 animate-pulse' : 'bg-neutral-300'}`} />
                 <span className="text-xs font-bold text-neutral-800">
-                  {isAutonomousActive ? 'RUNNING (Scheduled check cycles live)' : 'IDLE / OFF'}
+                  {isAutonomousActive ? 'RUNNING (Persists across browser sessions)' : 'IDLE / OFF'}
                 </span>
               </div>
             </div>
@@ -1462,7 +1653,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
                     <span>🕒 {realTimeClock || new Date().toLocaleTimeString()}</span>
                   </div>
                   <p className="text-[10px] text-neutral-500 leading-snug">
-                    Running in background. Monitoring system clock for slot times.
+                    Running continuously on server. Monitoring system clock for scheduled slots.
                   </p>
                 </div>
               ) : (
@@ -1471,7 +1662,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
                     <span>📅 Week {timeMachineWeek} Day {timeMachineDay} • {timeMachineTime}</span>
                   </div>
                   <p className="text-[10px] text-neutral-500 leading-snug">
-                    Time-machine warp: 1 campaign hour passes every 900ms.
+                    Fast chronological schedule. Jump-advances through already-published history.
                   </p>
                 </div>
               )}
@@ -1494,16 +1685,30 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
           {/* Staged & Pending Queue Block */}
           <div className="lg:col-span-4 p-4 rounded-xl bg-neutral-50 border border-neutral-200/60 flex flex-col justify-between space-y-3">
             <div className="space-y-1">
-              <span className="text-[10px] text-neutral-400 font-bold uppercase tracking-wider font-mono block">Queue Pending Count</span>
-              <span className="text-xl font-mono font-black text-neutral-900">{pendingPosts.length} posts remaining</span>
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-neutral-400 font-bold uppercase tracking-wider font-mono">Sequential Queue</span>
+                <span className="inline-flex items-center gap-1 text-[9px] font-mono font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200">
+                  <ShieldCheck className="w-3 h-3 text-emerald-600" />
+                  Zero Duplication
+                </span>
+              </div>
+              <div className="flex items-baseline gap-2">
+                <span className="text-xl font-mono font-black text-neutral-900">{pendingPosts.length}</span>
+                <span className="text-xs text-neutral-500 font-medium">pending posts</span>
+                <span className="text-xs text-neutral-400">•</span>
+                <span className="text-xs font-mono font-bold text-neutral-700">{228 - pendingPosts.length} published</span>
+              </div>
               <p className="text-[10px] text-neutral-500 leading-relaxed">
-                Posts are sequenced chronologically in sequence of days and slots inside your campaign layout.
+                Linked to posting history. Stopping and restarting resumes sequentially from the exact next unpublished day.
               </p>
             </div>
 
             {nextTarget ? (
               <div className="p-2.5 rounded-lg bg-white border border-neutral-200/80 text-xs space-y-1">
-                <span className="text-[9px] text-neutral-400 font-bold font-mono uppercase block">UPCOMING NEXT TARGET</span>
+                <div className="flex items-center justify-between">
+                  <span className="text-[9px] text-neutral-400 font-bold font-mono uppercase">NEXT UNPUBLISHED RESUME TARGET</span>
+                  <span className="text-[10px] font-mono text-neutral-400">{nextTarget.post.time || '12:00'}</span>
+                </div>
                 <div className="flex justify-between font-bold text-neutral-900">
                   <span>Week {nextTarget.weekNum} Day {nextTarget.dayNum}</span>
                   <span className="text-purple-700 font-mono text-[10px]">{nextTarget.post.role}</span>
@@ -1514,7 +1719,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
               </div>
             ) : (
               <div className="p-3 bg-green-50 text-green-800 border border-green-200 rounded-lg text-xs font-bold text-center">
-                🎉 Complete! All scheduled posts published.
+                🎉 Complete! All 228 campaign posts have been published without repetition.
               </div>
             )}
           </div>
@@ -2251,6 +2456,53 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
           </table>
         </div>
       </div>
+
+      {/* RESET CONFIRMATION MODAL */}
+      <AnimatePresence>
+        {showResetConfirm && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-neutral-900/60 backdrop-blur-xs">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4 border border-neutral-200"
+            >
+              <div className="flex items-center gap-3 text-neutral-900">
+                <div className="p-2.5 bg-amber-100 text-amber-700 rounded-xl">
+                  <RefreshCw className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-black text-base text-neutral-900">Reset Campaign Cycle to Day 1?</h3>
+                  <p className="text-xs text-neutral-500">Wipe posting history and restart sequence</p>
+                </div>
+              </div>
+
+              <p className="text-xs text-neutral-600 leading-relaxed">
+                By default, the autonomous scheduler is linked directly to your posting history to prevent re-posting already published content. 
+                <br /><br />
+                Resetting will clear all publish audit logs and history flags, allowing the scheduler to begin cleanly from <strong>Week 1 Day 1</strong> again.
+              </p>
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-neutral-100">
+                <button
+                  type="button"
+                  onClick={() => setShowResetConfirm(false)}
+                  className="px-4 py-2 text-xs font-semibold rounded-lg border border-neutral-200 hover:bg-neutral-50 text-neutral-700 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleResetCampaignAndHistory}
+                  className="px-4 py-2 text-xs font-bold rounded-lg bg-neutral-900 text-white hover:bg-neutral-800 transition"
+                >
+                  Confirm & Reset to Day 1
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
 
     </div>
   );

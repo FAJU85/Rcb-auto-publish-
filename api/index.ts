@@ -413,6 +413,7 @@ interface ServerSchedulerState {
   auditLogs: any[];
   autoConsoleLogs: string[];
   ledgerEntries: any[];
+  publishedPostIds: string[];
   lastTickTimestamp: number;
 }
 
@@ -426,6 +427,7 @@ let serverState: ServerSchedulerState = {
   auditLogs: [],
   autoConsoleLogs: [],
   ledgerEntries: [],
+  publishedPostIds: [],
   lastTickTimestamp: Date.now()
 };
 
@@ -436,6 +438,22 @@ function publishOnServer(target: any) {
   const timestampStr = new Date().toLocaleTimeString();
 
   if (!serverState.campaignData) return;
+
+  if (!serverState.publishedPostIds) {
+    serverState.publishedPostIds = [];
+  }
+
+  // Idempotency check: Never publish a post that has already been published
+  const isAlreadyPublished = serverState.publishedPostIds.includes(post.id) ||
+    serverState.auditLogs.some((l: any) => l.status === 'SUCCESS' && (l.postId === post.id || (l.postText && l.postText.trim() === post.text.trim())));
+
+  if (isAlreadyPublished) {
+    console.log(`[Server] Skipped duplicate post publish for ${post.id} (Week ${weekNum} Day ${dayNum})`);
+    return;
+  }
+
+  // Register in published IDs
+  serverState.publishedPostIds.push(post.id);
 
   // Mark as published in server campaignData
   serverState.campaignData.weeks = serverState.campaignData.weeks.map((w: any) => {
@@ -462,9 +480,14 @@ function publishOnServer(target: any) {
   serverState.autoConsoleLogs.unshift(`📢 [${timestampStr}] Successfully published to targets (Server Background Mode)`);
   serverState.autoConsoleLogs.unshift(`✅ [${timestampStr}] compliance Guardrail Audit: PASSED`);
 
-  // Log to audit logs
+  // Log to audit logs with complete metadata link to posting history
   const newLog = {
     id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+    postId: post.id,
+    weekNum: weekNum,
+    dayNum: dayNum,
+    slot: post.slot,
+    role: post.role,
     timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
     postText: post.text,
     postRef: `Week ${weekNum} Day ${dayNum} (${post.role} - ${post.type})`,
@@ -522,17 +545,29 @@ function startServerScheduler() {
     const now = Date.now();
     serverState.lastTickTimestamp = now;
 
-    // Find pending posts
+    // Collect all published post IDs and text signatures from auditLogs and publishedPostIds
+    const publishedIds = new Set<string>(serverState.publishedPostIds || []);
+    const publishedTexts = new Set<string>();
+    (serverState.auditLogs || []).forEach((log: any) => {
+      if (log.status === 'SUCCESS') {
+        if (log.postId) publishedIds.add(log.postId);
+        if (log.postText) publishedTexts.add(log.postText.trim());
+      }
+    });
+
+    // Find pending posts strictly non-repeating and linked to posting history
     const pending: any[] = [];
     serverState.campaignData.weeks.forEach((wk: any) => {
       wk.days.forEach((dy: any) => {
         dy.posts.forEach((p: any) => {
-          if (!p.isPublished) {
+          const isDone = p.isPublished || publishedIds.has(p.id) || (p.text && publishedTexts.has(p.text.trim()));
+          if (!isDone) {
             pending.push({ post: p, weekNum: wk.week, dayNum: dy.day, isFloat: false });
           }
         });
         dy.floats.forEach((f: any) => {
-          if (!f.isPublished) {
+          const isDone = f.isPublished || publishedIds.has(f.id) || (f.text && publishedTexts.has(f.text.trim()));
+          if (!isDone) {
             pending.push({ post: f, weekNum: wk.week, dayNum: dy.day, isFloat: true });
           }
         });
@@ -543,6 +578,10 @@ function startServerScheduler() {
     if (!nextTarget) {
       serverState.isAutonomousActive = false;
       serverState.autoConsoleLogs.unshift(`[${new Date().toLocaleTimeString()}] ✅ SYSTEM STOP: All campaign posts have been autonomously published!`);
+      if (serverInterval) {
+        clearInterval(serverInterval);
+        serverInterval = null;
+      }
       return;
     }
 
@@ -555,6 +594,17 @@ function startServerScheduler() {
         publishOnServer(nextTarget);
       }
     } else {
+      // Time-machine mode:
+      // Ensure the clock does not linger in the past of previous days that are already published
+      if (
+        serverState.timeMachineWeek < nextTarget.weekNum ||
+        (serverState.timeMachineWeek === nextTarget.weekNum && serverState.timeMachineDay < nextTarget.dayNum)
+      ) {
+        serverState.timeMachineWeek = nextTarget.weekNum;
+        serverState.timeMachineDay = nextTarget.dayNum;
+        serverState.timeMachineTime = '00:00';
+      }
+
       // Time-machine mode: 10 simulated minutes pass every 150ms.
       // Since this ticks every 1000ms: 1000ms / 150ms * 10 mins = 66 simulated minutes!
       const elapsedSimMins = 66; 
@@ -611,7 +661,8 @@ app.post("/api/scheduler/state", (req, res) => {
     campaignData, 
     auditLogs, 
     autoConsoleLogs, 
-    ledgerEntries 
+    ledgerEntries,
+    publishedPostIds
   } = req.body;
 
   if (isAutonomousActive !== undefined) serverState.isAutonomousActive = isAutonomousActive;
@@ -620,9 +671,21 @@ app.post("/api/scheduler/state", (req, res) => {
   if (timeMachineDay !== undefined) serverState.timeMachineDay = timeMachineDay;
   if (timeMachineTime !== undefined) serverState.timeMachineTime = timeMachineTime;
   if (campaignData !== undefined) serverState.campaignData = campaignData;
-  if (auditLogs !== undefined) serverState.auditLogs = auditLogs;
+  if (auditLogs !== undefined) {
+    serverState.auditLogs = auditLogs;
+    const pIds = new Set(serverState.publishedPostIds || []);
+    auditLogs.forEach((l: any) => {
+      if (l.status === 'SUCCESS' && l.postId) pIds.add(l.postId);
+    });
+    serverState.publishedPostIds = Array.from(pIds);
+  }
   if (autoConsoleLogs !== undefined) serverState.autoConsoleLogs = autoConsoleLogs;
   if (ledgerEntries !== undefined) serverState.ledgerEntries = ledgerEntries;
+  if (publishedPostIds !== undefined && Array.isArray(publishedPostIds)) {
+    const pIds = new Set(serverState.publishedPostIds || []);
+    publishedPostIds.forEach((id: string) => pIds.add(id));
+    serverState.publishedPostIds = Array.from(pIds);
+  }
 
   serverState.lastTickTimestamp = Date.now();
 
