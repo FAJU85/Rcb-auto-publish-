@@ -536,6 +536,10 @@ interface ServerSchedulerState {
   timeMachineWeek: number;
   timeMachineDay: number;
   timeMachineTime: string;
+  startFromWeek?: number;
+  startFromDay?: number;
+  startFromTime?: string;
+  republishFromStart?: boolean;
   campaignData: any;
   auditLogs: any[];
   autoConsoleLogs: string[];
@@ -552,6 +556,10 @@ let serverState: ServerSchedulerState = {
   timeMachineWeek: 1,
   timeMachineDay: 1,
   timeMachineTime: '00:00',
+  startFromWeek: 1,
+  startFromDay: 1,
+  startFromTime: '07:30',
+  republishFromStart: true,
   campaignData: null,
   auditLogs: [],
   autoConsoleLogs: [],
@@ -685,24 +693,45 @@ function startServerScheduler() {
       }
     });
 
-    // Find pending posts strictly non-repeating and linked to posting history
+    // Calculate starting coordinate: Week, Day, and Time
+    const sWeek = Number(serverState.startFromWeek) || 1;
+    const sDay = Number(serverState.startFromDay) || 1;
+    const sTime = serverState.startFromTime || '00:00';
+    const [sH, sM] = sTime.split(':').map(Number);
+    const startCoord = sWeek * 100000 + sDay * 10000 + ((isNaN(sH) ? 0 : sH) * 60 + (isNaN(sM) ? 0 : sM));
+
+    const getCoord = (w: number, d: number, t?: string) => {
+      const [h, m] = (t || '12:00').split(':').map(Number);
+      return w * 100000 + d * 10000 + ((isNaN(h) ? 12 : h) * 60 + (isNaN(m) ? 0 : m));
+    };
+
+    // Find pending posts starting strictly from user-specified start coordinate (Week, Day, Time)
     const pending: any[] = [];
     serverState.campaignData.weeks.forEach((wk: any) => {
       wk.days.forEach((dy: any) => {
         dy.posts.forEach((p: any) => {
-          const isDone = p.isPublished || publishedIds.has(p.id) || (p.text && publishedTexts.has(p.text.trim()));
-          if (!isDone) {
-            pending.push({ post: p, weekNum: wk.week, dayNum: dy.day, isFloat: false });
+          const coord = getCoord(wk.week, dy.day, p.time);
+          if (coord >= startCoord) {
+            const isDone = !serverState.republishFromStart && (p.isPublished || publishedIds.has(p.id) || (p.text && publishedTexts.has(p.text.trim())));
+            if (!isDone) {
+              pending.push({ post: p, weekNum: wk.week, dayNum: dy.day, isFloat: false, coord });
+            }
           }
         });
         dy.floats.forEach((f: any) => {
-          const isDone = f.isPublished || publishedIds.has(f.id) || (f.text && publishedTexts.has(f.text.trim()));
-          if (!isDone) {
-            pending.push({ post: f, weekNum: wk.week, dayNum: dy.day, isFloat: true });
+          const coord = getCoord(wk.week, dy.day, f.time || '14:00');
+          if (coord >= startCoord) {
+            const isDone = !serverState.republishFromStart && (f.isPublished || publishedIds.has(f.id) || (f.text && publishedTexts.has(f.text.trim())));
+            if (!isDone) {
+              pending.push({ post: f, weekNum: wk.week, dayNum: dy.day, isFloat: true, coord });
+            }
           }
         });
       });
     });
+
+    // Strictly sort chronologically from start coordinate
+    pending.sort((a, b) => a.coord - b.coord);
 
     const nextTarget = pending[0] || null;
     if (!nextTarget) {
@@ -808,6 +837,10 @@ app.post("/api/scheduler/state", (req, res) => {
     timeMachineWeek, 
     timeMachineDay, 
     timeMachineTime, 
+    startFromWeek,
+    startFromDay,
+    startFromTime,
+    republishFromStart,
     campaignData, 
     auditLogs, 
     autoConsoleLogs, 
@@ -821,6 +854,10 @@ app.post("/api/scheduler/state", (req, res) => {
   if (timeMachineWeek !== undefined) serverState.timeMachineWeek = timeMachineWeek;
   if (timeMachineDay !== undefined) serverState.timeMachineDay = timeMachineDay;
   if (timeMachineTime !== undefined) serverState.timeMachineTime = timeMachineTime;
+  if (startFromWeek !== undefined) serverState.startFromWeek = Number(startFromWeek);
+  if (startFromDay !== undefined) serverState.startFromDay = Number(startFromDay);
+  if (startFromTime !== undefined) serverState.startFromTime = String(startFromTime);
+  if (republishFromStart !== undefined) serverState.republishFromStart = Boolean(republishFromStart);
   if (campaignData !== undefined) serverState.campaignData = campaignData;
   if (auditLogs !== undefined) {
     serverState.auditLogs = auditLogs;

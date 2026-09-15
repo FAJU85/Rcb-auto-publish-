@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { 
   Share2, Check, RefreshCw, Key, Link2, LogOut, Terminal, ShieldCheck,
   Send, AlertCircle, Sparkles, Sliders, ChevronDown, CheckCircle2, XCircle,
-  Zap, Clock
+  Zap, Clock, Calendar, Play, RotateCcw
 } from 'lucide-react';
 import { CampaignData, Post, FloatPost, LedgerEntry } from '../types';
 
@@ -379,6 +379,25 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   const [timeMachineTime, setTimeMachineTime] = useState<string>(() => {
     return localStorage.getItem('campaign_time_machine_time') || '00:00';
   });
+
+  // User-selectable Autonomous Publishing Starting Position
+  const [startFromWeek, setStartFromWeek] = useState<number>(() => {
+    const saved = localStorage.getItem('campaign_start_from_week');
+    return saved ? Math.max(1, Number(saved)) : 1;
+  });
+  const [startFromDay, setStartFromDay] = useState<number>(() => {
+    const saved = localStorage.getItem('campaign_start_from_day');
+    return saved ? Math.max(1, Math.min(7, Number(saved))) : 1;
+  });
+  const [startFromTime, setStartFromTime] = useState<string>(() => {
+    return localStorage.getItem('campaign_start_from_time') || '07:30';
+  });
+  const [republishFromStart, setRepublishFromStart] = useState<boolean>(() => {
+    const saved = localStorage.getItem('campaign_republish_from_start');
+    return saved !== null ? saved === 'true' : true;
+  });
+  const sessionPublishedIds = useRef<Set<string>>(new Set());
+
   const [simSpeed, setSimSpeed] = useState<number>(6); // fallback seconds per post
   const [simProgress, setSimProgress] = useState<number>(0);
   const [autoConsoleLogs, setAutoConsoleLogs] = useState<string[]>([
@@ -415,6 +434,22 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
   useEffect(() => {
     localStorage.setItem('campaign_time_machine_time', timeMachineTime);
   }, [timeMachineTime]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_start_from_week', String(startFromWeek));
+  }, [startFromWeek]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_start_from_day', String(startFromDay));
+  }, [startFromDay]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_start_from_time', startFromTime);
+  }, [startFromTime]);
+
+  useEffect(() => {
+    localStorage.setItem('campaign_republish_from_start', republishFromStart ? 'true' : 'false');
+  }, [republishFromStart]);
 
   // Update heartbeat whenever active scheduler coordinates advance
   useEffect(() => {
@@ -494,6 +529,18 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             setTimeMachineWeek(serverData.timeMachineWeek);
             setTimeMachineDay(serverData.timeMachineDay);
             setTimeMachineTime(serverData.timeMachineTime);
+            if (serverData.startFromWeek !== undefined) {
+              setStartFromWeek(Number(serverData.startFromWeek));
+            }
+            if (serverData.startFromDay !== undefined) {
+              setStartFromDay(Number(serverData.startFromDay));
+            }
+            if (serverData.startFromTime !== undefined) {
+              setStartFromTime(String(serverData.startFromTime));
+            }
+            if (serverData.republishFromStart !== undefined) {
+              setRepublishFromStart(Boolean(serverData.republishFromStart));
+            }
             
             if (serverData.auditLogs && serverData.auditLogs.length > 0) {
               setAuditLogs(prev => {
@@ -554,6 +601,10 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             timeMachineWeek,
             timeMachineDay,
             timeMachineTime,
+            startFromWeek,
+            startFromDay,
+            startFromTime,
+            republishFromStart,
             campaignData,
             auditLogs,
             autoConsoleLogs,
@@ -567,30 +618,160 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
     const timeout = setTimeout(syncToServer, 500);
     return () => clearTimeout(timeout);
-  }, [isAutonomousActive, schedulerMode, realTimeCadence, timeMachineWeek, timeMachineDay, timeMachineTime, campaignData, auditLogs, autoConsoleLogs, publishedPostIds]);
+  }, [isAutonomousActive, schedulerMode, realTimeCadence, timeMachineWeek, timeMachineDay, timeMachineTime, startFromWeek, startFromDay, startFromTime, republishFromStart, campaignData, auditLogs, autoConsoleLogs, publishedPostIds]);
 
-  // Find all pending posts across all weeks and days strictly aware of posting history
-  const pendingPosts = useMemo(() => {
-    const list: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }[] = [];
+  // Helper to convert time string (HH:MM) to total minutes
+  const getPostMinutes = useCallback((timeStr?: string): number => {
+    if (!timeStr) return 12 * 60;
+    const [h, m] = timeStr.split(':').map(Number);
+    const hour = isNaN(h) ? 12 : h;
+    const min = isNaN(m) ? 0 : m;
+    return hour * 60 + min;
+  }, []);
+
+  // Linear coordinate calculation: Week * 100,000 + Day * 10,000 + MinuteOfDay
+  const getPostCoord = useCallback((weekNum: number, dayNum: number, timeStr?: string): number => {
+    return weekNum * 100000 + dayNum * 10000 + getPostMinutes(timeStr);
+  }, [getPostMinutes]);
+
+  // Current starting coordinate based on user selection
+  const startCoord = useMemo(() => {
+    return getPostCoord(startFromWeek, startFromDay, startFromTime);
+  }, [startFromWeek, startFromDay, startFromTime, getPostCoord]);
+
+  // All campaign posts ordered chronologically
+  const allCampaignPosts = useMemo(() => {
+    const list: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean; coord: number }[] = [];
     campaignData.weeks.forEach(wk => {
       wk.days.forEach(dy => {
         dy.posts.forEach(p => {
-          if (!isPostAlreadyPublished(p)) {
-            list.push({ post: p, weekNum: wk.week, dayNum: dy.day, isFloat: false });
-          }
+          list.push({ post: p, weekNum: wk.week, dayNum: dy.day, isFloat: false, coord: getPostCoord(wk.week, dy.day, p.time || '12:00') });
         });
         dy.floats.forEach(f => {
-          if (!isPostAlreadyPublished(f)) {
-            list.push({ post: f, weekNum: wk.week, dayNum: dy.day, isFloat: true });
-          }
+          list.push({ post: f, weekNum: wk.week, dayNum: dy.day, isFloat: true, coord: getPostCoord(wk.week, dy.day, f.time || '14:00') });
         });
       });
     });
+    list.sort((a, b) => a.coord - b.coord);
     return list;
-  }, [campaignData, isPostAlreadyPublished]);
+  }, [campaignData, getPostCoord]);
+
+  // Find all posts on the currently selected starting week and day for slot quick-picks
+  const selectedDayPosts = useMemo(() => {
+    const wk = campaignData.weeks.find(w => w.week === startFromWeek);
+    const dy = wk?.days.find(d => d.day === startFromDay);
+    if (!dy) return [];
+    const list = [
+      ...dy.posts.map(p => ({ post: p, isFloat: false })),
+      ...dy.floats.map(f => ({ post: f, isFloat: true }))
+    ];
+    list.sort((a, b) => getPostMinutes(a.post.time) - getPostMinutes(b.post.time));
+    return list;
+  }, [campaignData, startFromWeek, startFromDay, getPostMinutes]);
+
+  // Filter pending posts starting strictly from user-specified Week, Day, and Time coordinate
+  const pendingPosts = useMemo(() => {
+    return allCampaignPosts.filter(item => {
+      // Must be at or after user-selected start coordinate
+      if (item.coord < startCoord) return false;
+
+      // In active session with republishFromStart enabled, prevent duplicates within this session
+      if (republishFromStart) {
+        return !sessionPublishedIds.current.has(item.post.id);
+      }
+
+      // Otherwise check overall publication history
+      return !isPostAlreadyPublished(item.post);
+    });
+  }, [allCampaignPosts, startCoord, republishFromStart, isPostAlreadyPublished]);
 
   const nextTarget = pendingPosts[0] || null;
   const nextTargetId = nextTarget?.post.id || '';
+
+  // Immediate starting target post preview (the first post at or after startCoord)
+  const initialTargetPreview = useMemo(() => {
+    return allCampaignPosts.find(item => item.coord >= startCoord) || null;
+  }, [allCampaignPosts, startCoord]);
+
+  // Quick Action: Jump start coordinates to next unpublished post
+  const handleJumpToNextUnpublished = () => {
+    const firstUnpublished = allCampaignPosts.find(item => !isPostAlreadyPublished(item.post));
+    if (firstUnpublished) {
+      setStartFromWeek(firstUnpublished.weekNum);
+      setStartFromDay(firstUnpublished.dayNum);
+      const timeStr = firstUnpublished.post.time || '12:00';
+      setStartFromTime(timeStr);
+      if (!isAutonomousActive) {
+        setTimeMachineWeek(firstUnpublished.weekNum);
+        setTimeMachineDay(firstUnpublished.dayNum);
+        setTimeMachineTime(timeStr);
+      }
+      setAutoConsoleLogs(prev => [
+        `[${new Date().toLocaleTimeString()}] 🎯 Start position aligned with next unpublished post: Week ${firstUnpublished.weekNum} Day ${firstUnpublished.dayNum} (${timeStr}).`,
+        ...prev
+      ]);
+    }
+  };
+
+  // Quick Action: Reset start coordinates to beginning of campaign
+  const handleResetToCampaignStart = () => {
+    setStartFromWeek(1);
+    setStartFromDay(1);
+    setStartFromTime('07:30');
+    if (!isAutonomousActive) {
+      setTimeMachineWeek(1);
+      setTimeMachineDay(1);
+      setTimeMachineTime('07:30');
+    }
+    setAutoConsoleLogs(prev => [
+      `[${new Date().toLocaleTimeString()}] ⏪ Start position reset to Week 1 Day 1 (07:30).`,
+      ...prev
+    ]);
+  };
+
+  // Quick Action: Clear publication history from selected start coordinate onward
+  const handleResetHistoryFromStartPoint = () => {
+    const postsToClear = allCampaignPosts.filter(item => item.coord >= startCoord);
+    if (postsToClear.length === 0) return;
+
+    const idsToClear = new Set(postsToClear.map(item => item.post.id));
+    
+    // 1. Update localStorage published IDs
+    const savedIds = localStorage.getItem('campaign_published_ids');
+    if (savedIds) {
+      try {
+        const parsed = JSON.parse(savedIds);
+        if (Array.isArray(parsed)) {
+          const filtered = parsed.filter(id => !idsToClear.has(id));
+          localStorage.setItem('campaign_published_ids', JSON.stringify(filtered));
+        }
+      } catch (e) {}
+    }
+
+    // 2. Remove cleared posts from auditLogs so publishedPostIds updates reactively
+    setAuditLogs(prev => prev.filter(log => !log.postId || !idsToClear.has(log.postId)));
+
+    // 3. Clear in sessionPublishedIds
+    idsToClear.forEach(id => sessionPublishedIds.current.delete(id));
+
+    // 4. Update campaignData
+    if (onUpdateCampaignData) {
+      const updatedWeeks = campaignData.weeks.map(w => ({
+        ...w,
+        days: w.days.map(d => ({
+          ...d,
+          posts: d.posts.map(p => idsToClear.has(p.id) ? { ...p, isPublished: false } : p),
+          floats: d.floats.map(f => idsToClear.has(f.id) ? { ...f, isPublished: false } : f)
+        }))
+      }));
+      onUpdateCampaignData(updatedWeeks);
+    }
+
+    setAutoConsoleLogs(prev => [
+      `[${new Date().toLocaleTimeString()}] 🔄 Reset publication status for ${postsToClear.length} posts from Week ${startFromWeek} Day ${startFromDay} (${startFromTime}) onward.`,
+      ...prev
+    ]);
+  };
 
   // Autonomous posting execution handler
   const triggerAutoPublish = async (target: { post: Post | FloatPost; weekNum: number; dayNum: number; isFloat: boolean }) => {
@@ -602,14 +783,15 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
       const timestampStr = new Date().toLocaleTimeString();
 
-      // 1. Strict Idempotency Guard: NEVER publish any post that has already been published
-      if (isPostAlreadyPublished(post)) {
+      // Strict Idempotency Guard: prevent duplicates in current run
+      if (sessionPublishedIds.current.has(post.id) || (!republishFromStart && isPostAlreadyPublished(post))) {
         setAutoConsoleLogs(prev => [
-          `⚠️ [${timestampStr}] Duplicate avoided: Post "${post.id}" (Week ${weekNum} Day ${dayNum}) is already recorded in posting history. Advancing to next scheduled post.`,
+          `⚠️ [${timestampStr}] Duplicate avoided: Post "${post.id}" (Week ${weekNum} Day ${dayNum}) was already dispatched. Advancing to next scheduled post.`,
           ...prev
         ]);
         return;
       }
+      sessionPublishedIds.current.add(post.id);
 
     // Identify active linked platforms
     const activeTargets = Object.keys(connections || {}).filter(id => {
@@ -774,38 +956,45 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     await triggerAutoPublish(nextTarget);
   };
 
-  // Sync Time Machine clock to the upcoming post's day start when activated manually
+  // Sync Time Machine clock to user's selected start position when activated manually
   useEffect(() => {
     const wasInactive = !prevActiveRef.current;
-    if (isAutonomousActive && nextTarget && wasInactive) {
-      if (schedulerMode === 'timemachine') {
-        setTimeMachineWeek(nextTarget.weekNum);
-        setTimeMachineDay(nextTarget.dayNum);
+    if (isAutonomousActive && wasInactive) {
+      // Clear session published IDs on fresh start so selected start posts can dispatch
+      sessionPublishedIds.current.clear();
+
+      if (nextTarget) {
+        if (schedulerMode === 'timemachine') {
+          setTimeMachineWeek(nextTarget.weekNum);
+          setTimeMachineDay(nextTarget.dayNum);
+          
+          // Determine starting time: either startFromTime or 15 mins before target
+          const targetTimeStr = nextTarget.post.time || '12:00';
+          const [tH, tM] = targetTimeStr.split(':').map(Number);
+          const targetTotalMins = (isNaN(tH) ? 12 : tH) * 60 + (isNaN(tM) ? 0 : tM);
+          
+          const [sH, sM] = (startFromTime || '07:30').split(':').map(Number);
+          const startUserMins = (isNaN(sH) ? 7 : sH) * 60 + (isNaN(sM) ? 30 : sM);
+          
+          const startMins = Math.min(startUserMins, Math.max(0, targetTotalMins - 15));
+          const startH = Math.floor(startMins / 60);
+          const startM = startMins % 60;
+          const startTimeStr = `${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}`;
+          
+          setTimeMachineTime(startTimeStr);
+          setSimProgress(0);
+        }
         
-        // Target post scheduled time
-        const targetTimeStr = nextTarget.post.time || '12:00';
-        const [tH, tM] = targetTimeStr.split(':').map(Number);
-        const targetTotalMins = (isNaN(tH) ? 12 : tH) * 60 + (isNaN(tM) ? 0 : tM);
-        
-        // Start simulated time shortly before target post (30 mins before)
-        const startMins = Math.max(0, targetTotalMins - 30);
-        const startH = Math.floor(startMins / 60);
-        const startM = startMins % 60;
-        const startTimeStr = `${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}`;
-        
-        setTimeMachineTime(startTimeStr);
-        setSimProgress(0);
+        const totalPostsCount = 228;
+        const remainingCount = pendingPosts.length;
+        setAutoConsoleLogs(prev => [
+          `[${new Date().toLocaleTimeString()}] 🚀 Autonomous Auto-Publisher started from Week ${startFromWeek} Day ${startFromDay} (${startFromTime}). First queued post: Week ${nextTarget.weekNum} Day ${nextTarget.dayNum} - ${nextTarget.post.role} (${nextTarget.post.time || '12:00'}).`,
+          `[${new Date().toLocaleTimeString()}] 📜 Pipeline Queue: ${remainingCount} posts ready for automated publishing starting from selected coordinates.`,
+          ...prev
+        ]);
       }
-      
-      const totalPostsCount = 228;
-      const publishedCount = totalPostsCount - pendingPosts.length;
-      setAutoConsoleLogs(prev => [
-        `[${new Date().toLocaleTimeString()}] 🚀 Autonomous Auto-Publisher started. Resuming sequentially at Week ${nextTarget.weekNum} Day ${nextTarget.dayNum} - ${nextTarget.post.role} (${nextTarget.post.time || '12:00'}).`,
-        `[${new Date().toLocaleTimeString()}] 📜 Posting History linked: ${publishedCount} / ${totalPostsCount} posts published. Strictly sequential and duplicate-free.`,
-        ...prev
-      ]);
     }
-  }, [isAutonomousActive, schedulerMode, nextTargetId]);
+  }, [isAutonomousActive, schedulerMode, nextTargetId, startFromWeek, startFromDay, startFromTime]);
 
   useEffect(() => {
     if (!isAutonomousActive) {
@@ -1713,6 +1902,257 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
                 </>
               )}
             </button>
+          </div>
+        </div>
+
+        {/* AUTONOMOUS PUBLISHING START COORDINATES SELECTOR */}
+        <div className="p-4 rounded-xl bg-neutral-50/80 border border-neutral-200 space-y-3.5" id="autonomous-start-coordinates-panel">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-neutral-200/80 pb-3">
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2">
+                <Calendar className="w-4 h-4 text-neutral-800" />
+                <h4 className="text-xs font-extrabold text-neutral-900 tracking-tight">
+                  Autonomous Publishing Starting Coordinates
+                </h4>
+                <span className="px-2 py-0.5 rounded-full bg-neutral-200/80 text-neutral-800 font-mono text-[10px] font-bold">
+                  Week {startFromWeek} • Day {startFromDay} • {startFromTime}
+                </span>
+              </div>
+              <p className="text-[11px] text-neutral-500 leading-relaxed">
+                Choose the exact Week, Day, and Time for the autonomous publisher to begin dispatching.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={handleJumpToNextUnpublished}
+                disabled={isAutonomousActive}
+                className="px-2.5 py-1.5 rounded-lg bg-white border border-neutral-200 hover:border-neutral-300 text-neutral-700 text-[11px] font-semibold transition flex items-center gap-1.5 shadow-2xs disabled:opacity-50"
+                title="Jump to the earliest unpublished post in the campaign"
+              >
+                <span>🎯 Next Unpublished</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleResetToCampaignStart}
+                disabled={isAutonomousActive}
+                className="px-2.5 py-1.5 rounded-lg bg-white border border-neutral-200 hover:border-neutral-300 text-neutral-700 text-[11px] font-semibold transition flex items-center gap-1.5 shadow-2xs disabled:opacity-50"
+                title="Reset starting point to Week 1 Day 1"
+              >
+                <RotateCcw className="w-3 h-3 text-neutral-500" />
+                <span>Reset to W1 D1</span>
+              </button>
+            </div>
+          </div>
+
+          {/* 3-Column Coordinates Selection Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-3.5">
+            {/* 1. Week Selector */}
+            <div className="md:col-span-3 space-y-1.5">
+              <label className="block text-[10px] font-mono font-bold text-neutral-500 uppercase">
+                1. Starting Week
+              </label>
+              <select
+                id="start-week-selector"
+                value={startFromWeek}
+                onChange={e => {
+                  const w = Number(e.target.value);
+                  setStartFromWeek(w);
+                  if (!isAutonomousActive) setTimeMachineWeek(w);
+                }}
+                disabled={isAutonomousActive}
+                className="w-full text-xs font-bold rounded-lg border border-neutral-300 bg-white py-2 px-2.5 text-neutral-900 focus:ring-1 focus:ring-neutral-900 focus:outline-none disabled:opacity-60 shadow-2xs"
+              >
+                {campaignData.weeks.map(wk => (
+                  <option key={wk.week} value={wk.week}>
+                    Week {wk.week} ({wk.days.length} Days)
+                  </option>
+                ))}
+              </select>
+              <span className="text-[10px] text-neutral-400 block font-medium">
+                Selects the campaign cycle week.
+              </span>
+            </div>
+
+            {/* 2. Day Selector */}
+            <div className="md:col-span-5 space-y-1.5">
+              <label className="block text-[10px] font-mono font-bold text-neutral-500 uppercase">
+                2. Starting Day
+              </label>
+              <div className="grid grid-cols-7 gap-1" id="start-day-selector">
+                {[1, 2, 3, 4, 5, 6, 7].map(d => {
+                  const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+                  const isSelected = startFromDay === d;
+                  return (
+                    <button
+                      key={d}
+                      type="button"
+                      onClick={() => {
+                        setStartFromDay(d);
+                        if (!isAutonomousActive) setTimeMachineDay(d);
+                      }}
+                      disabled={isAutonomousActive}
+                      className={`py-1.5 rounded-md text-[11px] font-bold transition flex flex-col items-center justify-center ${
+                        isSelected
+                          ? 'bg-neutral-900 text-white shadow-xs'
+                          : 'bg-white text-neutral-700 border border-neutral-200 hover:bg-neutral-100 disabled:opacity-50'
+                      }`}
+                    >
+                      <span className="text-[9px] font-medium opacity-80">{dayNames[d - 1]}</span>
+                      <span>D{d}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <span className="text-[10px] text-neutral-400 block font-medium">
+                Day within selected Week {startFromWeek}.
+              </span>
+            </div>
+
+            {/* 3. Time Selector */}
+            <div className="md:col-span-4 space-y-1.5">
+              <label className="block text-[10px] font-mono font-bold text-neutral-500 uppercase">
+                3. Starting Time (HH:MM)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="start-time-input"
+                  type="time"
+                  value={startFromTime}
+                  onChange={e => {
+                    const t = e.target.value;
+                    setStartFromTime(t);
+                    if (!isAutonomousActive) setTimeMachineTime(t);
+                  }}
+                  disabled={isAutonomousActive}
+                  className="w-full text-xs font-mono font-bold rounded-lg border border-neutral-300 bg-white py-1.5 px-2.5 text-neutral-900 focus:ring-1 focus:ring-neutral-900 focus:outline-none disabled:opacity-60 shadow-2xs"
+                />
+              </div>
+              <span className="text-[10px] text-neutral-400 block font-medium">
+                Posts prior to this time on Day {startFromDay} will be bypassed.
+              </span>
+            </div>
+          </div>
+
+          {/* Fast Slot Pickers for Scheduled Posts on Selected Day */}
+          {selectedDayPosts.length > 0 && (
+            <div className="p-2.5 rounded-lg bg-white border border-neutral-200/80 space-y-1.5">
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="font-mono font-bold text-neutral-500 uppercase">
+                  Quick-Select Scheduled Slots for Week {startFromWeek} Day {startFromDay}:
+                </span>
+                <span className="text-neutral-400">{selectedDayPosts.length} posts configured</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {selectedDayPosts.map((item, idx) => {
+                  const slotTime = item.post.time || '12:00';
+                  const isCurrent = startFromTime === slotTime;
+                  return (
+                    <button
+                      key={item.post.id || idx}
+                      type="button"
+                      onClick={() => {
+                        setStartFromTime(slotTime);
+                        if (!isAutonomousActive) setTimeMachineTime(slotTime);
+                      }}
+                      disabled={isAutonomousActive}
+                      className={`px-2.5 py-1 rounded-md text-[10px] font-mono font-semibold transition flex items-center gap-1 border ${
+                        isCurrent
+                          ? 'bg-neutral-900 text-white border-neutral-900 shadow-2xs'
+                          : 'bg-neutral-50 text-neutral-700 border-neutral-200 hover:bg-neutral-100 disabled:opacity-50'
+                      }`}
+                    >
+                      <Clock className="w-2.5 h-2.5" />
+                      <span>{slotTime}</span>
+                      <span className="opacity-70 font-sans text-[9px]">• {item.post.role}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* First Dispatched Post Preview Strip */}
+          <div className="p-3 rounded-lg bg-white border border-neutral-200 space-y-2">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-mono font-bold text-neutral-500 uppercase">
+                  Target Post at Starting Point:
+                </span>
+                {initialTargetPreview ? (
+                  <span className="text-xs font-bold text-neutral-900">
+                    Week {initialTargetPreview.weekNum} • Day {initialTargetPreview.dayNum} ({initialTargetPreview.post.time || '12:00'})
+                  </span>
+                ) : (
+                  <span className="text-xs font-medium text-amber-700">
+                    No posts found after this coordinate.
+                  </span>
+                )}
+              </div>
+
+              {initialTargetPreview && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  {isPostAlreadyPublished(initialTargetPreview.post) ? (
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] font-semibold text-amber-800 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
+                        Recorded in History
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleResetHistoryFromStartPoint}
+                        className="text-[10px] font-semibold text-purple-700 hover:text-purple-900 underline"
+                        title="Clear published status from this slot onward"
+                      >
+                        Reset history from here
+                      </button>
+                    </div>
+                  ) : (
+                    <span className="text-[10px] font-semibold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                      ✓ Ready to Dispatch
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {initialTargetPreview && (
+              <div className="p-2 rounded-md bg-neutral-50 border border-neutral-100 text-[11px] text-neutral-700 flex items-start justify-between gap-3">
+                <div className="space-y-0.5 min-w-0">
+                  <div className="flex items-center gap-2 text-[10px] font-mono">
+                    <span className="font-bold text-neutral-900">{initialTargetPreview.post.role}</span>
+                    <span className="text-neutral-400">({initialTargetPreview.post.type})</span>
+                  </div>
+                  <p className="italic text-neutral-600 truncate">
+                    "{initialTargetPreview.post.text}"
+                  </p>
+                </div>
+                <span className="text-[10px] font-mono text-neutral-400 shrink-0">
+                  {initialTargetPreview.post.time || '12:00'}
+                </span>
+              </div>
+            )}
+
+            {/* Re-publishing Toggle Option */}
+            <div className="pt-1 border-t border-neutral-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <label className="flex items-center gap-2 cursor-pointer select-none text-[11px] text-neutral-700 font-medium">
+                <input
+                  type="checkbox"
+                  checked={republishFromStart}
+                  onChange={e => setRepublishFromStart(e.target.checked)}
+                  disabled={isAutonomousActive}
+                  className="rounded text-neutral-900 border-neutral-300 focus:ring-0 focus:outline-none"
+                />
+                <span>Allow publishing from start point even if previously marked published</span>
+              </label>
+
+              {isAutonomousActive && (
+                <span className="text-[10px] font-bold text-green-700 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-600 animate-pulse" />
+                  <span>Pipeline active from this coordinate.</span>
+                </span>
+              )}
+            </div>
           </div>
         </div>
 
