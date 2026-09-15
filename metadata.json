@@ -1,6 +1,6 @@
 {
   "name": "X Campaign Planner & Scheduler",
-  "description": "An interactive planning, simulation, and analysis dashboard for the @r_comic_book monthly marketing campaign on X.",
+  "description": "An interactive planning, simulation, and 24/7 autonomous multi-platform publishing dashboard for marketing campaigns across Telegram, Bluesky, X, Discord, and Slack.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

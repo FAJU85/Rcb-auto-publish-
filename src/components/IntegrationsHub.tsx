@@ -287,6 +287,8 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     localStorage.setItem('campaign_publish_logs', JSON.stringify(auditLogs));
   }, [auditLogs]);
 
+  const [syncedPublishedIds, setSyncedPublishedIds] = useState<string[]>([]);
+
   // Maintain persistent Set of published post IDs and text signatures directly linked to posting history
   const { publishedPostIds, publishedPostTexts } = useMemo(() => {
     const ids = new Set<string>();
@@ -300,6 +302,8 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       } catch (e) {}
     }
 
+    syncedPublishedIds.forEach(id => ids.add(id));
+
     auditLogs.forEach(log => {
       if (log.status === 'SUCCESS') {
         if (log.postId) ids.add(log.postId);
@@ -308,7 +312,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     });
 
     return { publishedPostIds: ids, publishedPostTexts: texts };
-  }, [auditLogs]);
+  }, [auditLogs, syncedPublishedIds]);
 
   // Persist publishedPostIds to localStorage
   useEffect(() => {
@@ -559,6 +563,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
               const setIds = new Set<string>(currentSaved ? JSON.parse(currentSaved) : []);
               serverData.publishedPostIds.forEach((id: string) => setIds.add(id));
               localStorage.setItem('campaign_published_ids', JSON.stringify(Array.from(setIds)));
+              setSyncedPublishedIds(Array.from(setIds));
             }
 
             if (serverData.campaignData && onUpdateCampaignData) {
@@ -587,6 +592,50 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
     loadServerState();
   }, []); // Run once on component mount
 
+  // Periodic Polling: Periodically fetch server state (every 12s) to discover background-published posts while browser was closed/idle
+  useEffect(() => {
+    if (!isAutonomousActive) return;
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/scheduler/state');
+        if (res.ok) {
+          const sData = await res.json();
+          if (sData.publishedPostIds && sData.publishedPostIds.length > 0) {
+            const currentSaved = localStorage.getItem('campaign_published_ids');
+            const setIds = new Set<string>(currentSaved ? JSON.parse(currentSaved) : []);
+            sData.publishedPostIds.forEach((id: string) => setIds.add(id));
+            localStorage.setItem('campaign_published_ids', JSON.stringify(Array.from(setIds)));
+            setSyncedPublishedIds(Array.from(setIds));
+          }
+          if (sData.auditLogs && sData.auditLogs.length > 0) {
+            setAuditLogs(prev => {
+              const existingIds = new Set(prev.map(l => l.id));
+              const newItems = sData.auditLogs.filter((l: any) => !existingIds.has(l.id));
+              if (newItems.length > 0) {
+                return [...newItems, ...prev];
+              }
+              return prev;
+            });
+          }
+          if (sData.autoConsoleLogs && sData.autoConsoleLogs.length > 0) {
+            setAutoConsoleLogs(prev => {
+              if (prev.length === 0 || sData.autoConsoleLogs[0] !== prev[0]) {
+                const combined = Array.from(new Set([...sData.autoConsoleLogs, ...prev]));
+                return combined.slice(0, 100);
+              }
+              return prev;
+            });
+          }
+        }
+      } catch (e) {
+        // silent background poll error
+      }
+    }, 12000);
+
+    return () => clearInterval(pollInterval);
+  }, [isAutonomousActive]);
+
   // 2. Continuous Synchronization: Push scheduler changes to the server
   useEffect(() => {
     const syncToServer = async () => {
@@ -606,6 +655,9 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             startFromTime,
             republishFromStart,
             campaignData,
+            connections,
+            userTimezoneOffset: new Date().getTimezoneOffset(),
+            userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             auditLogs,
             autoConsoleLogs,
             publishedPostIds: Array.from(publishedPostIds)
@@ -618,7 +670,7 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
 
     const timeout = setTimeout(syncToServer, 500);
     return () => clearTimeout(timeout);
-  }, [isAutonomousActive, schedulerMode, realTimeCadence, timeMachineWeek, timeMachineDay, timeMachineTime, startFromWeek, startFromDay, startFromTime, republishFromStart, campaignData, auditLogs, autoConsoleLogs, publishedPostIds]);
+  }, [isAutonomousActive, schedulerMode, realTimeCadence, timeMachineWeek, timeMachineDay, timeMachineTime, startFromWeek, startFromDay, startFromTime, republishFromStart, campaignData, connections, auditLogs, autoConsoleLogs, publishedPostIds]);
 
   // Helper to convert time string (HH:MM) to total minutes
   const getPostMinutes = useCallback((timeStr?: string): number => {
@@ -954,6 +1006,51 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
       ...prev
     ]);
     await triggerAutoPublish(nextTarget);
+  };
+
+  const [isTriggeringCron, setIsTriggeringCron] = useState(false);
+
+  // Manual trigger for 24/7 Cloud Background Cron heartbeat (/api/cron)
+  const handleTriggerCronHeartbeat = async () => {
+    setIsTriggeringCron(true);
+    try {
+      setAutoConsoleLogs(prev => [
+        `[${new Date().toLocaleTimeString()}] 🛰️ Testing 24/7 Vercel Background Cron Heartbeat (/api/cron)...`,
+        ...prev
+      ]);
+      const res = await fetch('/api/cron');
+      const data = await res.json();
+      if (res.ok) {
+        const resultReason = data.tickResult?.reason || (data.tickResult?.published ? 'Post Dispatched Successfully' : 'Scheduler tick processed');
+        setAutoConsoleLogs(prev => [
+          `[${new Date().toLocaleTimeString()}] 🛰️ 24/7 Cloud Cron Response: ${resultReason}`,
+          ...prev
+        ]);
+        // Refresh scheduler state to update published posts & audit logs
+        const stateRes = await fetch('/api/scheduler/state');
+        if (stateRes.ok) {
+          const sData = await stateRes.json();
+          if (sData.publishedPostIds) {
+            setSyncedPublishedIds(sData.publishedPostIds);
+          }
+          if (sData.auditLogs) {
+            setAuditLogs(sData.auditLogs);
+          }
+        }
+      } else {
+        setAutoConsoleLogs(prev => [
+          `[${new Date().toLocaleTimeString()}] ❌ 24/7 Cron Heartbeat error: ${data.error || 'Server rejected request'}`,
+          ...prev
+        ]);
+      }
+    } catch (err: any) {
+      setAutoConsoleLogs(prev => [
+        `[${new Date().toLocaleTimeString()}] ❌ 24/7 Cron Network Exception: ${err.message}`,
+        ...prev
+      ]);
+    } finally {
+      setIsTriggeringCron(false);
+    }
   };
 
   // Sync Time Machine clock to user's selected start position when activated manually
@@ -2160,14 +2257,33 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
           {/* Active Progress & Countdown */}
           <div className="lg:col-span-4 p-4 rounded-xl bg-neutral-50 border border-neutral-200/60 flex flex-col justify-between space-y-3.5">
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               <span className="text-[10px] text-neutral-400 font-bold uppercase tracking-wider font-mono block">Active Pipeline Status</span>
-              <div className="flex items-center gap-2">
-                <span className={`w-3 h-3 rounded-full ${isAutonomousActive ? 'bg-green-600 animate-pulse' : 'bg-neutral-300'}`} />
-                <span className="text-xs font-bold text-neutral-800">
-                  {isAutonomousActive ? 'RUNNING (Persists across browser sessions)' : 'IDLE / OFF'}
-                </span>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <span className={`w-3 h-3 rounded-full ${isAutonomousActive ? 'bg-green-600 animate-pulse' : 'bg-neutral-300'}`} />
+                  <span className="text-xs font-bold text-neutral-800">
+                    {isAutonomousActive ? 'RUNNING (24/7 Cloud Background)' : 'IDLE / OFF'}
+                  </span>
+                </div>
+                {isAutonomousActive && (
+                  <button
+                    type="button"
+                    onClick={handleTriggerCronHeartbeat}
+                    disabled={isTriggeringCron}
+                    className="text-[9px] font-mono px-2 py-0.5 rounded bg-neutral-200 hover:bg-neutral-300 text-neutral-800 font-bold transition disabled:opacity-50 flex items-center gap-1"
+                    title="Manually trigger /api/cron to verify background heartbeat without browser"
+                  >
+                    <span>🛰️</span>
+                    <span>{isTriggeringCron ? 'Pinging...' : 'Ping /api/cron'}</span>
+                  </button>
+                )}
               </div>
+              <p className="text-[10px] text-neutral-500 leading-tight">
+                {isAutonomousActive 
+                  ? '⚡ 24/7 Persistent Server Engine active. Automated Vercel Cron (`/api/cron`) executes scheduled posts even if your browser or device is shut down.' 
+                  : 'Turn ON to begin autonomous scheduled publishing to connected platforms.'}
+              </p>
             </div>
 
             {/* Scheduler Mode Selection */}
