@@ -2528,6 +2528,18 @@ export const IntegrationsHub: React.FC<IntegrationsHubProps> = ({
             </div>
           </div>
         </div>
+
+        {/* 24/7 Serverless Cron Timing Explanation Banner */}
+        <div className="p-3.5 rounded-xl bg-amber-50/80 border border-amber-200/80 flex items-start gap-3">
+          <Clock className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+          <div className="space-y-1 text-xs text-amber-900">
+            <p className="font-bold">Why did the post publish at 07:39 instead of 07:30?</p>
+            <p className="text-amber-800/90 leading-relaxed">
+              Because Vercel hosts apps as <strong>serverless functions</strong> which scale to zero when idle. When you opened your browser at 07:39 and loaded <code className="font-mono bg-amber-100 px-1 py-0.5 rounded">rcbautopubl.vercel.app</code>, the request woke up the server, which immediately processed the pending 07:30 slot. 
+              To make posts fire at the exact minute (07:30 sharp) without opening your browser, set up a free background ping (e.g., via <a href="https://cron-job.org" target="_blank" rel="noreferrer" className="underline font-bold">cron-job.org</a> or UptimeRobot) to ping <code className="font-mono bg-amber-100 px-1 py-0.5 rounded">https://rcbautopubl.vercel.app/api/cron</code> every <strong>1 minute</strong>.
+            </p>
+          </div>
+        </div>
       </div>
 
       {/* CAMPAIGN IDENTITY INTEGRATION & TARGET PROFILE */}
