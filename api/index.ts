@@ -553,6 +553,8 @@ interface ServerSchedulerState {
   timeMachineWeek: number;
   timeMachineDay: number;
   timeMachineTime: string;
+  campaignStartDate?: string;
+  startFromDate?: string;
   startFromWeek?: number;
   startFromDay?: number;
   startFromTime?: string;
@@ -576,6 +578,8 @@ let serverState: ServerSchedulerState = {
   timeMachineWeek: 1,
   timeMachineDay: 1,
   timeMachineTime: '00:00',
+  campaignStartDate: undefined,
+  startFromDate: undefined,
   startFromWeek: 1,
   startFromDay: 1,
   startFromTime: '07:30',
@@ -830,23 +834,46 @@ export async function processSchedulerTick(): Promise<{
     const cadence = serverState.realTimeCadence || 'slot_time';
 
     if (cadence === 'slot_time') {
-      // Calculate user's current local minutes respecting their local timezone offset
       const now = new Date();
-      let curMins: number;
-      if (typeof serverState.userTimezoneOffset === 'number') {
-        const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
-        const userDate = new Date(utcMs - (serverState.userTimezoneOffset * 60000));
-        curMins = userDate.getHours() * 60 + userDate.getMinutes();
-      } else {
-        curMins = now.getHours() * 60 + now.getMinutes();
+      // Determine campaign base start date (YYYY-MM-DD). If not set, use today's date in user's local timezone.
+      let campaignBaseDate = serverState.campaignStartDate;
+      if (!campaignBaseDate) {
+        let localYear = now.getFullYear();
+        let localMonth = now.getMonth();
+        let localDay = now.getDate();
+        if (typeof serverState.userTimezoneOffset === 'number') {
+          const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
+          const userDate = new Date(utcMs - (serverState.userTimezoneOffset * 60000));
+          localYear = userDate.getFullYear();
+          localMonth = userDate.getMonth();
+          localDay = userDate.getDate();
+        }
+        campaignBaseDate = `${localYear}-${String(localMonth + 1).padStart(2, '0')}-${String(localDay).padStart(2, '0')}`;
+        serverState.campaignStartDate = campaignBaseDate;
       }
+
+      // Calculate target day's calendar date: (weekNum - 1) * 7 + (dayNum - 1)
+      const targetDayOffset = (nextTarget.weekNum - 1) * 7 + (nextTarget.dayNum - 1);
+      const [bY, bM, bD] = campaignBaseDate.split('-').map(Number);
+      const targetDateObj = new Date(bY, (bM || 1) - 1, (bD || 1) + targetDayOffset);
+      const tY = targetDateObj.getFullYear();
+      const tM = targetDateObj.getMonth();
+      const tD = targetDateObj.getDate();
 
       const targetTimeStr = nextTarget.post.time || '12:00';
       const [targetHour, targetMin] = targetTimeStr.split(':').map(Number);
-      const targetMins = (isNaN(targetHour) ? 12 : targetHour) * 60 + (isNaN(targetMin) ? 0 : targetMin);
+      const tH = isNaN(targetHour) ? 12 : targetHour;
+      const tMin = isNaN(targetMin) ? 0 : targetMin;
 
-      // Due check: If current wall-clock minutes is >= target scheduled time, and cooldown passed
-      const isDue = curMins >= targetMins;
+      // Target exact timestamp in UTC ms (accounting for user's local timezone offset)
+      let targetUtcMs: number;
+      if (typeof serverState.userTimezoneOffset === 'number') {
+        targetUtcMs = Date.UTC(tY, tM, tD, tH, tMin, 0, 0) + (serverState.userTimezoneOffset * 60000);
+      } else {
+        targetUtcMs = new Date(tY, tM, tD, tH, tMin, 0, 0).getTime();
+      }
+
+      const isDue = nowMs >= targetUtcMs;
       const cooldownOk = nowMs - lastPublish >= 4000;
 
       if (isDue && cooldownOk) {
@@ -854,10 +881,14 @@ export async function processSchedulerTick(): Promise<{
         await publishOnServer(nextTarget);
         return { executed: true, published: true, target: nextTarget };
       } else {
+        const diffMs = targetUtcMs - nowMs;
+        const diffHours = Math.max(0, Math.floor(diffMs / 3600000));
+        const diffMinutes = Math.max(0, Math.floor((diffMs % 3600000) / 60000));
+        const formattedTargetDate = `${tY}-${String(tM + 1).padStart(2, '0')}-${String(tD).padStart(2, '0')}`;
         return {
           executed: true,
           published: false,
-          reason: `Target post slot ${targetTimeStr} (${targetMins}m) not reached yet (current local: ${Math.floor(curMins/60)}:${curMins%60})`
+          reason: `Target post Week ${nextTarget.weekNum} Day ${nextTarget.dayNum} scheduled for ${formattedTargetDate} at ${targetTimeStr} (due in ${diffHours}h ${diffMinutes}m)`
         };
       }
     } else {
@@ -906,18 +937,17 @@ export async function processSchedulerTick(): Promise<{
     const [targetHour, targetMin] = targetTimeStr.split(':').map(Number);
     const targetMins = (isNaN(targetHour) ? 12 : targetHour) * 60 + (isNaN(targetMin) ? 0 : targetMin);
 
-    const isCorrectTimeWindow = (
-      currentWeek === nextTarget.weekNum &&
-      currentDay === nextTarget.dayNum &&
-      currentMins <= targetMins &&
-      nextMins >= targetMins
+    const isTargetReached = (
+      (serverState.timeMachineWeek > nextTarget.weekNum) ||
+      (serverState.timeMachineWeek === nextTarget.weekNum && serverState.timeMachineDay > nextTarget.dayNum) ||
+      (serverState.timeMachineWeek === nextTarget.weekNum && serverState.timeMachineDay === nextTarget.dayNum && nextMins >= targetMins)
     );
 
-    if (isCorrectTimeWindow) {
+    if (isTargetReached) {
       await publishOnServer(nextTarget);
       return { executed: true, published: true, target: nextTarget };
     } else {
-      return { executed: true, published: false, reason: 'Time-machine advancing' };
+      return { executed: true, published: false, reason: `Time-machine advancing to W${currentWeek} D${currentDay} ${serverState.timeMachineTime}` };
     }
   }
 }
@@ -967,6 +997,8 @@ app.post("/api/scheduler/state", (req, res) => {
     timeMachineWeek, 
     timeMachineDay, 
     timeMachineTime, 
+    campaignStartDate,
+    startFromDate,
     startFromWeek,
     startFromDay,
     startFromTime,
@@ -987,6 +1019,8 @@ app.post("/api/scheduler/state", (req, res) => {
   if (timeMachineWeek !== undefined) serverState.timeMachineWeek = timeMachineWeek;
   if (timeMachineDay !== undefined) serverState.timeMachineDay = timeMachineDay;
   if (timeMachineTime !== undefined) serverState.timeMachineTime = timeMachineTime;
+  if (campaignStartDate !== undefined) serverState.campaignStartDate = String(campaignStartDate);
+  if (startFromDate !== undefined) serverState.startFromDate = String(startFromDate);
   if (startFromWeek !== undefined) serverState.startFromWeek = Number(startFromWeek);
   if (startFromDay !== undefined) serverState.startFromDay = Number(startFromDay);
   if (startFromTime !== undefined) serverState.startFromTime = String(startFromTime);
